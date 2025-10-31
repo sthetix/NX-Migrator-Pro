@@ -2,23 +2,18 @@
 
 A professional partition management tool for Nintendo Switch SD cards with dual-mode operation: Migration and Cleanup.
 
-![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6?logo=windows)
-![License](https://img.shields.io/badge/License-GPL--2.0-green?logo=gnu)
-![Status](https://img.shields.io/badge/Status-Stable-success)
-![Version](https://img.shields.io/badge/Version-2.0.0-blue)
-
 <div align="center">
-  <img src="images/preview.jpg" alt="NX Migrator Pro Preview" width="50%">
+  <img src="images/preview.jpg" alt="NX Migrator Pro Preview" width="65%">
 </div>
 
 ## Overview
 
 NX Migrator Pro provides two powerful modes for managing your Nintendo Switch SD card partitions:
 
-### 🔄 Migration Mode
+### Migration Mode
 Migrate partitions from a smaller SD card to a larger one with automatic FAT32 expansion.
 
-### 🧹 Cleanup Mode
+### Cleanup Mode
 Remove unwanted partitions (Linux/Android/emuMMC) from a single SD card and reclaim space for FAT32.
 
 ## Features
