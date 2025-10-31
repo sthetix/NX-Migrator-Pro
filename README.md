@@ -349,7 +349,7 @@ Copyright (c) 2024
 - Check [existing issues](https://github.com/sthetix/NX-Migrator-Pro/issues) for solutions
 - Review this README and troubleshooting section
 
-### Support My Work
+## Support My Work
 
 If you find this project useful, please consider supporting me by buying me a coffee!
 
