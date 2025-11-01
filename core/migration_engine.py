@@ -1078,27 +1078,28 @@ rescan
 
         logger.info(f"Starting robocopy: {source} -> {target}")
 
-        # Robocopy command with options:
+        # Robocopy command with optimized options for SD card migration:
         # /E - copy subdirectories including empty ones
-        # /COPY:DAT - copy data, attributes, timestamps
-        # /R:2 - retry 2 times on failure
+        # /COPY:D - copy ONLY data (skip attributes/timestamps for speed)
+        # /R:1 - retry only 1 time on failure (reduced from 2)
         # /W:1 - wait 1 second between retries
         # /NP - no progress percentage (we'll track ourselves)
-        # /V - verbose output (show files being copied)
+        # /J - unbuffered I/O for large files (faster for sequential writes)
+        # /MT:2 - only 2 threads (reduces contention on USB/SD)
+        # /BYTES - show file sizes in bytes (helps with progress tracking)
 
         cmd = [
             'robocopy',
             source,
             target,
             '/E',           # Copy subdirectories including empty
-            '/COPY:DAT',    # Copy data, attributes, timestamps
-            '/DCOPY:DAT',   # Copy directory timestamps
-            '/R:2',         # Retry 2 times
+            '/COPY:D',      # Copy ONLY data (skip attributes/timestamps for speed)
+            '/R:1',         # Retry only 1 time (reduced overhead)
             '/W:1',         # Wait 1 second between retries
             '/NP',          # No progress percentage per file
-            '/V',           # Verbose - show files being copied
-            '/TEE',         # Output to console and log
-            '/MT:8'         # Multi-threaded (8 threads for speed)
+            '/J',           # Unbuffered I/O for large files
+            '/MT:2',        # Only 2 threads (better for USB/SD drives)
+            '/BYTES'        # Show progress with byte counts
         ]
 
         logger.info(f"Robocopy command: {' '.join(cmd)}")
@@ -1106,6 +1107,7 @@ rescan
 
         try:
             # Run robocopy with real-time output
+            start_time = time.time()
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -1121,8 +1123,37 @@ rescan
             # Track progress by monitoring output
             files_copied = 0
             dirs_created = 0
+            bytes_copied = 0
+            last_progress_time = start_time
+            last_file = ""
+            monitor_running = [True]  # Shared flag for monitor thread
 
-            logger.info("Robocopy started, monitoring output...")
+            logger.info("Robocopy started with optimized settings...")
+
+            # Start a background thread to monitor target directory and provide heartbeat
+            def monitor_target():
+                """Background thread to monitor target directory for progress"""
+                last_count = 0
+                while monitor_running[0] and process.poll() is None:
+                    try:
+                        # Count files in target directory
+                        file_count = sum(1 for _ in Path(target).rglob('*') if _.is_file())
+
+                        if file_count != last_count:
+                            logger.info(f"Target directory now has {file_count} files")
+                            last_count = file_count
+
+                        # Update progress
+                        elapsed = time.time() - start_time
+                        self._report_progress(stage_name, base_progress + 5,
+                                            f"Copying... {file_count} files so far ({elapsed:.0f}s)")
+                    except Exception as e:
+                        logger.debug(f"Monitor thread error: {e}")
+
+                    time.sleep(3)  # Check every 3 seconds
+
+            monitor_thread = threading.Thread(target=monitor_target, daemon=True)
+            monitor_thread.start()
 
             # Read output line by line in real-time
             for line in process.stdout:
@@ -1131,37 +1162,62 @@ rescan
                 if not line:
                     continue
 
-                # Log every line for visibility
-                if line.startswith('New File'):
-                    # Extract filename from "New File               123        filename.ext"
+                # Check if this line indicates a file being copied
+                # Robocopy with default output shows files in various formats
+                if line.startswith('New File') or line.startswith('Newer') or (line and '\\' in line and not line.startswith('-') and not line.startswith('Total')):
+                    # This is likely a file operation
+                    files_copied += 1
+                    last_file = line
+
+                    # Log periodically
+                    if files_copied % 50 == 0:
+                        logger.info(f"Copied {files_copied} files...")
+
+                # Parse summary lines
+                elif line.startswith('Dirs :'):
                     parts = line.split()
                     if len(parts) >= 3:
-                        filename = ' '.join(parts[3:])
-                        logger.info(f"Copying: {filename}")
-                        files_copied += 1
+                        try:
+                            dirs_created = int(parts[2])
+                            logger.info(f"Robocopy summary: {line}")
+                        except ValueError:
+                            pass
 
-                        # Update progress every 10 files
-                        if files_copied % 10 == 0:
-                            self._report_progress(stage_name, base_progress + 5,
-                                                f"Copied {files_copied} files...")
-
-                elif line.startswith('New Dir'):
-                    # Extract directory name
+                elif line.startswith('Files :'):
                     parts = line.split()
                     if len(parts) >= 3:
-                        dirname = ' '.join(parts[2:])
-                        logger.info(f"Creating directory: {dirname}")
-                        dirs_created += 1
+                        try:
+                            files_total = int(parts[2])
+                            logger.info(f"Robocopy summary: {line}")
+                            # Use the summary count if it's higher (more accurate)
+                            if files_total > files_copied:
+                                files_copied = files_total
+                        except ValueError:
+                            pass
 
-                elif 'Error' in line or 'Failed' in line:
+                elif line.startswith('Bytes :'):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        try:
+                            bytes_copied = int(parts[2])
+                            logger.info(f"Robocopy summary: {line}")
+                        except ValueError:
+                            pass
+
+                elif 'Error' in line or 'ERROR' in line or 'Failed' in line:
                     logger.warning(f"Robocopy warning: {line}")
 
-                elif line.startswith('Dirs :') or line.startswith('Files :'):
-                    # Summary line - log it
-                    logger.info(f"Robocopy: {line}")
+                # Log all output for debugging
+                else:
+                    logger.debug(f"Robocopy output: {line}")
 
             # Wait for process to complete
             process.wait(timeout=3600)
+
+            # Stop monitor thread
+            monitor_running[0] = False
+
+            elapsed_time = time.time() - start_time
 
             # Check stderr for errors
             stderr_output = process.stderr.read()
@@ -1181,12 +1237,17 @@ rescan
                 logger.error(f"Robocopy errors: {stderr_output}")
                 raise Exception(f"File copy failed with robocopy error code {process.returncode}")
 
-            logger.info(f"Robocopy completed successfully")
-            logger.info(f"Files copied: {files_copied}, Directories created: {dirs_created}")
+            # Calculate performance metrics
+            mb_copied = bytes_copied / (1024 * 1024) if bytes_copied > 0 else 0
+            speed_mbps = mb_copied / elapsed_time if elapsed_time > 0 else 0
+
+            logger.info(f"Robocopy completed successfully in {elapsed_time:.1f} seconds")
+            logger.info(f"Files copied: {files_copied}, Directories: {dirs_created}")
+            logger.info(f"Data copied: {mb_copied:.1f} MB at {speed_mbps:.1f} MB/s")
             logger.info(f"Return code: {process.returncode}")
 
             self._report_progress(stage_name, base_progress + 60,
-                                f"Copied {files_copied} files successfully")
+                                f"Copied {files_copied} files in {elapsed_time:.0f}s")
 
         except subprocess.TimeoutExpired:
             logger.error("Robocopy timed out after 1 hour")

@@ -806,8 +806,11 @@ class MainWindow:
 
     def _on_operation_progress(self, stage, percent, message):
         """Called during operation progress (migration or cleanup)"""
-        self.root.after(0, self.progress_panel.update, stage, percent, message)
-        self.root.after(0, self._update_status, message)
+        # Show stage and percent in progress panel (top)
+        self.root.after(0, self.progress_panel.update, stage, percent)
+        # Show detailed message in status bar (bottom)
+        status_message = f"{stage} - {message}"
+        self.root.after(0, self._update_status, status_message)
 
     def _on_operation_complete(self):
         """Called when operation completes successfully (migration or cleanup)"""
