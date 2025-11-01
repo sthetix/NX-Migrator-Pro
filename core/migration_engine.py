@@ -240,8 +240,12 @@ class MigrationEngine:
         """Single-threaded copy (original method, for low-memory systems)"""
         sectors_copied = 0
         last_progress_update = 0
+        start_time = time.time()
+        last_log_time = start_time
 
         # Note: disk is already prepared by _copy_partitions(), no need to prepare again
+
+        logger.info(f"Starting sector copy: {total_sectors} sectors ({(total_sectors * SECTOR_SIZE) / (1024**3):.2f} GB)")
 
         while sectors_copied < total_sectors:
             if self.cancelled:
@@ -270,19 +274,44 @@ class MigrationEngine:
 
             sectors_copied += sectors_to_copy
 
-            # Report progress less frequently (every 2%)
+            # Calculate progress and speed
             percent = (sectors_copied / total_sectors) * 100
-            if percent - last_progress_update >= 2.0 or sectors_copied == total_sectors:
-                progress = base_progress + (percent / 100) * (70 / len(self.source_layout.partitions))
-                mb_copied = (sectors_copied * SECTOR_SIZE) // (1024 * 1024)
-                mb_total = (total_sectors * SECTOR_SIZE) // (1024 * 1024)
+            elapsed = time.time() - start_time
+            current_time = time.time()
 
-                self._report_progress(
-                    stage_name,
-                    progress,
-                    f"Copied {mb_copied} MB / {mb_total} MB ({percent:.1f}%)"
-                )
+            # Report progress more frequently (every 1% or every 5 seconds)
+            should_update = (percent - last_progress_update >= 1.0 or
+                           sectors_copied == total_sectors or
+                           (current_time - last_log_time) >= 5.0)
+
+            if should_update:
+                progress = base_progress + (percent / 100) * (70 / len(self.source_layout.partitions))
+                mb_copied = (sectors_copied * SECTOR_SIZE) / (1024 * 1024)
+                mb_total = (total_sectors * SECTOR_SIZE) / (1024 * 1024)
+
+                # Calculate speed
+                speed_mbps = mb_copied / elapsed if elapsed > 0 else 0
+
+                # Estimate time remaining
+                if speed_mbps > 0:
+                    remaining_mb = mb_total - mb_copied
+                    eta_seconds = remaining_mb / speed_mbps
+                    eta_mins = int(eta_seconds / 60)
+                    eta_secs = int(eta_seconds % 60)
+                    eta_str = f" - ETA: {eta_mins}m {eta_secs}s"
+                else:
+                    eta_str = ""
+
+                log_msg = (f"Copied {mb_copied:.1f} MB / {mb_total:.1f} MB ({percent:.1f}%) "
+                          f"at {speed_mbps:.1f} MB/s{eta_str}")
+
+                logger.info(log_msg)
+                self._report_progress(stage_name, progress, log_msg)
+
                 last_progress_update = percent
+                last_log_time = current_time
+
+        logger.info(f"Sector copy completed in {elapsed:.1f} seconds")
 
     def _copy_partition_data_threaded(self, source_part, target_part, stage_name,
                                        base_progress, chunk_sectors, total_sectors):
@@ -297,7 +326,12 @@ class MigrationEngine:
         # Shared state
         sectors_copied = [0]  # Use list for mutable reference
         last_progress_update = [0]
+        start_time = [time.time()]
+        last_log_time = [time.time()]
         error_holder = [None]
+
+        logger.info(f"Starting threaded sector copy: {total_sectors} sectors ({(total_sectors * SECTOR_SIZE) / (1024**3):.2f} GB)")
+        logger.info(f"Using {NUM_BUFFERS} buffers with {chunk_sectors} sectors per chunk")
 
         def reader_thread():
             """Read chunks from source disk"""
@@ -354,19 +388,42 @@ class MigrationEngine:
                     # Update progress
                     sectors_copied[0] += sectors_written
 
-                    # Report progress less frequently (every 2%)
+                    # Calculate progress and speed
                     percent = (sectors_copied[0] / total_sectors) * 100
-                    if percent - last_progress_update[0] >= 2.0 or sectors_copied[0] == total_sectors:
-                        progress = base_progress + (percent / 100) * (70 / len(self.source_layout.partitions))
-                        mb_copied = (sectors_copied[0] * SECTOR_SIZE) // (1024 * 1024)
-                        mb_total = (total_sectors * SECTOR_SIZE) // (1024 * 1024)
+                    elapsed = time.time() - start_time[0]
+                    current_time = time.time()
 
-                        self._report_progress(
-                            stage_name,
-                            progress,
-                            f"Copied {mb_copied} MB / {mb_total} MB ({percent:.1f}%)"
-                        )
+                    # Report progress more frequently (every 1% or every 5 seconds)
+                    should_update = (percent - last_progress_update[0] >= 1.0 or
+                                   sectors_copied[0] == total_sectors or
+                                   (current_time - last_log_time[0]) >= 5.0)
+
+                    if should_update:
+                        progress = base_progress + (percent / 100) * (70 / len(self.source_layout.partitions))
+                        mb_copied = (sectors_copied[0] * SECTOR_SIZE) / (1024 * 1024)
+                        mb_total = (total_sectors * SECTOR_SIZE) / (1024 * 1024)
+
+                        # Calculate speed
+                        speed_mbps = mb_copied / elapsed if elapsed > 0 else 0
+
+                        # Estimate time remaining
+                        if speed_mbps > 0:
+                            remaining_mb = mb_total - mb_copied
+                            eta_seconds = remaining_mb / speed_mbps
+                            eta_mins = int(eta_seconds / 60)
+                            eta_secs = int(eta_seconds % 60)
+                            eta_str = f" - ETA: {eta_mins}m {eta_secs}s"
+                        else:
+                            eta_str = ""
+
+                        log_msg = (f"Copied {mb_copied:.1f} MB / {mb_total:.1f} MB ({percent:.1f}%) "
+                                  f"at {speed_mbps:.1f} MB/s{eta_str}")
+
+                        logger.info(log_msg)
+                        self._report_progress(stage_name, progress, log_msg)
+
                         last_progress_update[0] = percent
+                        last_log_time[0] = current_time
 
                     write_queue.task_done()
 
@@ -390,6 +447,9 @@ class MigrationEngine:
 
         if self.cancelled:
             raise Exception("Migration cancelled by user")
+
+        elapsed = time.time() - start_time[0]
+        logger.info(f"Threaded sector copy completed in {elapsed:.1f} seconds")
 
     def _copy_fat32_files(self, source_part, target_part, stage_name, base_progress):
         """Copy FAT32 partition using file-level copy (much faster than sector copy)"""
@@ -1024,8 +1084,7 @@ rescan
         # /R:2 - retry 2 times on failure
         # /W:1 - wait 1 second between retries
         # /NP - no progress percentage (we'll track ourselves)
-        # /NDL - no directory list
-        # /NFL - no file list (optional, for cleaner output)
+        # /V - verbose output (show files being copied)
 
         cmd = [
             'robocopy',
@@ -1037,25 +1096,77 @@ rescan
             '/R:2',         # Retry 2 times
             '/W:1',         # Wait 1 second between retries
             '/NP',          # No progress percentage per file
-            '/NDL',         # No directory listing
+            '/V',           # Verbose - show files being copied
             '/TEE',         # Output to console and log
             '/MT:8'         # Multi-threaded (8 threads for speed)
         ]
 
         logger.info(f"Robocopy command: {' '.join(cmd)}")
-        self._report_progress(stage_name, base_progress, "Copying files with robocopy...")
+        self._report_progress(stage_name, base_progress, "Scanning source files...")
 
         try:
-            # Run robocopy
-            result = subprocess.run(
+            # Run robocopy with real-time output
+            process = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=3600,  # 1 hour timeout
                 encoding='utf-8',
                 errors='replace',
-                creationflags=subprocess.CREATE_NO_WINDOW
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                bufsize=1,  # Line buffered
+                universal_newlines=True
             )
+
+            # Track progress by monitoring output
+            files_copied = 0
+            dirs_created = 0
+
+            logger.info("Robocopy started, monitoring output...")
+
+            # Read output line by line in real-time
+            for line in process.stdout:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                # Log every line for visibility
+                if line.startswith('New File'):
+                    # Extract filename from "New File               123        filename.ext"
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        filename = ' '.join(parts[3:])
+                        logger.info(f"Copying: {filename}")
+                        files_copied += 1
+
+                        # Update progress every 10 files
+                        if files_copied % 10 == 0:
+                            self._report_progress(stage_name, base_progress + 5,
+                                                f"Copied {files_copied} files...")
+
+                elif line.startswith('New Dir'):
+                    # Extract directory name
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        dirname = ' '.join(parts[2:])
+                        logger.info(f"Creating directory: {dirname}")
+                        dirs_created += 1
+
+                elif 'Error' in line or 'Failed' in line:
+                    logger.warning(f"Robocopy warning: {line}")
+
+                elif line.startswith('Dirs :') or line.startswith('Files :'):
+                    # Summary line - log it
+                    logger.info(f"Robocopy: {line}")
+
+            # Wait for process to complete
+            process.wait(timeout=3600)
+
+            # Check stderr for errors
+            stderr_output = process.stderr.read()
+            if stderr_output:
+                logger.warning(f"Robocopy stderr: {stderr_output}")
 
             # Robocopy return codes:
             # 0 = No files copied
@@ -1065,19 +1176,21 @@ rescan
             # 8 = Copy errors
             # 16 = Fatal error
 
-            if result.returncode >= 8:
-                logger.error(f"Robocopy failed with return code {result.returncode}")
-                logger.error(f"Robocopy output: {result.stdout}")
-                logger.error(f"Robocopy errors: {result.stderr}")
-                raise Exception(f"File copy failed with robocopy error code {result.returncode}")
+            if process.returncode >= 8:
+                logger.error(f"Robocopy failed with return code {process.returncode}")
+                logger.error(f"Robocopy errors: {stderr_output}")
+                raise Exception(f"File copy failed with robocopy error code {process.returncode}")
 
-            logger.info(f"Robocopy completed with return code {result.returncode}")
-            logger.info(f"Robocopy output: {result.stdout}")
+            logger.info(f"Robocopy completed successfully")
+            logger.info(f"Files copied: {files_copied}, Directories created: {dirs_created}")
+            logger.info(f"Return code: {process.returncode}")
 
-            self._report_progress(stage_name, base_progress + 60, "Files copied successfully")
+            self._report_progress(stage_name, base_progress + 60,
+                                f"Copied {files_copied} files successfully")
 
         except subprocess.TimeoutExpired:
             logger.error("Robocopy timed out after 1 hour")
+            process.kill()
             raise Exception("File copy timed out")
         except Exception as e:
             logger.error(f"Robocopy error: {e}")
