@@ -685,7 +685,7 @@ class MainWindow:
                 no_text="Cancel",
                 style="danger",
                 width=550,
-                height=300
+                height=330
             )
 
             if not response2:
@@ -920,6 +920,12 @@ class MainWindow:
 
     def show_custom_info(self, title, message, parent=None, blocking=True, width=400, height=200):
         """Show a custom centered info dialog"""
+        # Scale down for 1080p (cosmetic improvement)
+        screen_height = self.root.winfo_screenheight()
+        if screen_height < 1440:  # 1080p or lower
+            width = int(width * 0.75)
+            height = int(height * 0.75)
+
         parent_window = parent if parent else self.root
         dialog = ttk.Toplevel(parent_window)
         dialog.title(title)
@@ -967,6 +973,12 @@ class MainWindow:
 
     def show_custom_confirm(self, title, message, yes_text="Yes", no_text="No", style="primary", width=450, height=250):
         """Show a custom centered confirmation dialog that returns True or False."""
+        # Scale down for 1080p (cosmetic improvement)
+        screen_height = self.root.winfo_screenheight()
+        if screen_height < 1440:  # 1080p or lower
+            width = int(width * 0.75)
+            height = int(height * 0.75)
+
         dialog = ttk.Toplevel(self.root)
         dialog.title(title)
         dialog.transient(self.root)
@@ -1174,7 +1186,7 @@ For more help:
                 "Error",
                 f"Failed to open browser:\n\n{str(e)}",
                 width=450,
-                height=200
+                height=250
             )
 
     def _show_about(self):
@@ -1208,6 +1220,12 @@ Made for the Nintendo Switch homebrew community
 
     def _show_scrollable_dialog(self, title, content, width=600, height=500):
         """Show a scrollable text dialog"""
+        # Scale down for 1080p (cosmetic improvement)
+        screen_height = self.root.winfo_screenheight()
+        if screen_height < 1440:  # 1080p or lower
+            width = int(width * 0.75)
+            height = int(height * 0.75)
+
         dialog = ttk.Toplevel(self.root)
         dialog.title(title)
         dialog.transient(self.root)
