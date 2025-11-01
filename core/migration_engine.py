@@ -505,7 +505,8 @@ class MigrationEngine:
                         input=diskpart_script,
                         capture_output=True,
                         text=True,
-                        timeout=30
+                        timeout=30,
+                        creationflags=subprocess.CREATE_NO_WINDOW
                     )
                     time.sleep(RETRY_DELAY)
 
@@ -531,7 +532,8 @@ assign
             input=diskpart_script,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
 
         if result.returncode != 0:
@@ -579,7 +581,8 @@ assign
             input=diskpart_script,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
 
         if result.returncode != 0 and "already assigned" not in result.stdout.lower():
@@ -630,7 +633,7 @@ assign
                 if attempt < MAX_RETRIES - 1:
                     logger.info(f"Partition not found, refreshing and waiting {RETRY_DELAY}s...")
                     diskpart_script = f"select disk {disk_index}\nrescan\n"
-                    subprocess.run(['diskpart'], input=diskpart_script, capture_output=True, text=True, timeout=30)
+                    subprocess.run(['diskpart'], input=diskpart_script, capture_output=True, text=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
                     time.sleep(RETRY_DELAY)
 
             except Exception as e:
@@ -685,7 +688,8 @@ assign
             input="Y\n",  # Auto-confirm the format operation
             capture_output=True,
             text=True,
-            timeout=300  # 5 minute timeout
+            timeout=300,  # 5 minute timeout
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
 
         logger.info(f"Format command output:\n{result.stdout}")
@@ -823,7 +827,8 @@ remove
                 input=diskpart_script,
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=30,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
 
             if result.returncode == 0:
@@ -933,7 +938,8 @@ exit
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
             stdout, stderr = process.communicate(input=script, timeout=30)
 
@@ -960,7 +966,8 @@ exit
                         stdin=subprocess.PIPE,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
-                        text=True
+                        text=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW
                     )
                     verify_out, _ = verify_process.communicate(input=verify_script, timeout=30)
 
@@ -993,7 +1000,8 @@ rescan
                 input=diskpart_script,
                 capture_output=True,
                 text=True,
-                timeout=10
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
 
             logger.info("Disk partitions refreshed")
@@ -1045,7 +1053,8 @@ rescan
                 text=True,
                 timeout=3600,  # 1 hour timeout
                 encoding='utf-8',
-                errors='replace'
+                errors='replace',
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
 
             # Robocopy return codes:

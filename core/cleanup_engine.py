@@ -213,7 +213,8 @@ class CleanupEngine:
             input="Y\n",  # Auto-confirm
             capture_output=True,
             text=True,
-            timeout=300
+            timeout=300,
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
 
         logger.info(f"Format command output:\n{result.stdout}")
@@ -409,7 +410,8 @@ class CleanupEngine:
                 text=True,
                 timeout=3600,
                 encoding='utf-8',
-                errors='replace'
+                errors='replace',
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
 
             # Robocopy return codes: 0-7 are success, 8+ are errors
@@ -483,7 +485,8 @@ assign
             input=diskpart_script,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
 
         if result.returncode != 0 and "already assigned" not in result.stdout.lower():
@@ -526,7 +529,7 @@ assign
                 if attempt < MAX_RETRIES - 1:
                     logger.info(f"Partition not found, refreshing...")
                     diskpart_script = f"select disk {disk_index}\nrescan\n"
-                    subprocess.run(['diskpart'], input=diskpart_script, capture_output=True, text=True, timeout=30)
+                    subprocess.run(['diskpart'], input=diskpart_script, capture_output=True, text=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)
                     time.sleep(RETRY_DELAY)
 
             except Exception as e:
@@ -550,7 +553,8 @@ rescan
                 input=diskpart_script,
                 capture_output=True,
                 text=True,
-                timeout=10
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
 
             logger.info("Disk partitions refreshed")

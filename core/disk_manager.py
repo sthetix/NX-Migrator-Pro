@@ -411,7 +411,8 @@ class DiskManager:
                 input=diskpart_script,
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=30,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
 
             if result.returncode == 0:
@@ -452,7 +453,8 @@ class DiskManager:
                     input=diskpart_script,
                     capture_output=True,
                     text=True,
-                    timeout=10
+                    timeout=10,
+                    creationflags=subprocess.CREATE_NO_WINDOW
                 )
 
                 if result.returncode == 0:
