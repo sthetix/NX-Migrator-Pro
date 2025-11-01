@@ -238,5 +238,12 @@ class MigrationOptionsFrame(ttk.Frame):
             self.emummc_check.config(state=DISABLED)
             self.emummc_var.set(False)  # Uncheck if disabled
 
-        # Trigger options changed callback
-        self._on_option_changed()
+        # Update internal options state but DON'T trigger callback
+        # This prevents double calculation when scanning
+        self.options = {
+            'migrate_fat32': self.fat32_var.get(),
+            'migrate_linux': self.linux_var.get(),
+            'migrate_android': self.android_var.get(),
+            'migrate_emummc': self.emummc_var.get(),
+            'expand_fat32': self.expand_var.get()
+        }

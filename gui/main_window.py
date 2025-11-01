@@ -454,6 +454,19 @@ class MainWindow:
             has_emummc=source_layout.has_emummc
         )
 
+        # Sync the options from the frame to ensure we use the correct state
+        if self.current_mode == "migration":
+            self.migration_options = self.migration_options_frame.options.copy()
+        else:
+            # Convert to cleanup options format
+            options = self.migration_options_frame.options
+            self.cleanup_options = {
+                'remove_linux': options['migrate_linux'],
+                'remove_android': options['migrate_android'],
+                'remove_emummc': options['migrate_emummc'],
+                'expand_fat32': options['expand_fat32']
+            }
+
         # Update status
         summary = source_layout.get_summary()
 
@@ -570,31 +583,31 @@ class MainWindow:
             if self.migration_options['migrate_fat32']:
                 src_fat = self.source_layout.get_fat32_size_mb()
                 dst_fat = self.target_layout.get_fat32_size_mb()
+                fat32_gain = dst_fat - src_fat
                 if self.migration_options['expand_fat32']:
-                    msg += f"✓ FAT32: {src_fat} MB → {dst_fat} MB (+{dst_fat - src_fat} MB)\n"
+                    msg += f"✓ FAT32: {src_fat:,} MB → {dst_fat:,} MB (+{fat32_gain:,} MB gained)\n"
                 else:
-                    msg += f"✓ FAT32: {src_fat} MB → {dst_fat} MB\n"
+                    msg += f"✓ FAT32: {src_fat:,} MB → {dst_fat:,} MB (no expansion)\n"
 
             # Linux
             if self.source_layout.has_linux and self.migration_options['migrate_linux']:
                 linux_size = self.source_layout.get_linux_size_mb()
-                msg += f"✓ Linux: {linux_size} MB (preserved)\n"
+                msg += f"✓ Linux: {linux_size:,} MB (preserved)\n"
 
             # Android
             if self.source_layout.has_android and self.migration_options['migrate_android']:
                 android_size = self.source_layout.get_android_size_mb()
                 android_type = "Dynamic" if self.source_layout.android_dynamic else "Legacy"
-                msg += f"✓ Android ({android_type}): {android_size} MB (preserved)\n"
+                msg += f"✓ Android ({android_type}): {android_size:,} MB (preserved)\n"
 
             # emuMMC
             if self.source_layout.has_emummc and self.migration_options['migrate_emummc']:
                 emummc_size = self.source_layout.get_emummc_size_mb()
                 emummc_type = "Dual" if self.source_layout.emummc_double else "Single"
-                msg += f"✓ emuMMC ({emummc_type}): {emummc_size} MB (preserved)\n"
+                msg += f"✓ emuMMC ({emummc_type}): {emummc_size:,} MB (preserved)\n"
 
             msg += f"\nSource Disk: {self.source_disk['size_gb']:.1f} GB\n"
-            msg += f"Target Disk: {self.target_disk['size_gb']:.1f} GB\n"
-            msg += f"Free Space After Migration: {self.target_layout.get_free_space_mb()} MB"
+            msg += f"Target Disk: {self.target_disk['size_gb']:.1f} GB"
 
             self.show_custom_info("Layout Comparison", msg, width=550, height=400)
 
@@ -604,48 +617,39 @@ class MainWindow:
             # FAT32
             src_fat = self.source_layout.get_fat32_size_mb()
             dst_fat = self.target_layout.get_fat32_size_mb()
+            fat32_gain = dst_fat - src_fat
             if self.cleanup_options['expand_fat32']:
-                msg += f"✓ FAT32: {src_fat} MB → {dst_fat} MB (+{dst_fat - src_fat} MB)\n"
+                msg += f"✓ FAT32: {src_fat:,} MB → {dst_fat:,} MB (+{fat32_gain:,} MB reclaimed)\n"
             else:
-                msg += f"✓ FAT32: {src_fat} MB (unchanged)\n"
+                msg += f"✓ FAT32: {src_fat:,} MB (no expansion)\n"
 
             # Linux
             if self.source_layout.has_linux:
                 linux_size = self.source_layout.get_linux_size_mb()
                 if self.cleanup_options['remove_linux']:
-                    msg += f"✗ Linux: {linux_size} MB (will be REMOVED)\n"
+                    msg += f"✗ Linux: {linux_size:,} MB (will be REMOVED)\n"
                 else:
-                    msg += f"✓ Linux: {linux_size} MB (preserved)\n"
+                    msg += f"✓ Linux: {linux_size:,} MB (preserved)\n"
 
             # Android
             if self.source_layout.has_android:
                 android_size = self.source_layout.get_android_size_mb()
                 android_type = "Dynamic" if self.source_layout.android_dynamic else "Legacy"
                 if self.cleanup_options['remove_android']:
-                    msg += f"✗ Android ({android_type}): {android_size} MB (will be REMOVED)\n"
+                    msg += f"✗ Android ({android_type}): {android_size:,} MB (will be REMOVED)\n"
                 else:
-                    msg += f"✓ Android ({android_type}): {android_size} MB (preserved)\n"
+                    msg += f"✓ Android ({android_type}): {android_size:,} MB (preserved)\n"
 
             # emuMMC
             if self.source_layout.has_emummc:
                 emummc_size = self.source_layout.get_emummc_size_mb()
                 emummc_type = "Dual" if self.source_layout.emummc_double else "Single"
                 if self.cleanup_options['remove_emummc']:
-                    msg += f"✗ emuMMC ({emummc_type}): {emummc_size} MB (will be REMOVED)\n"
+                    msg += f"✗ emuMMC ({emummc_type}): {emummc_size:,} MB (will be REMOVED)\n"
                 else:
-                    msg += f"✓ emuMMC ({emummc_type}): {emummc_size} MB (preserved)\n"
+                    msg += f"✓ emuMMC ({emummc_type}): {emummc_size:,} MB (preserved)\n"
 
-            msg += f"\nSD Card: {self.source_disk['size_gb']:.1f} GB\n"
-
-            # Show meaningful space info based on whether FAT32 was expanded
-            if self.cleanup_options['expand_fat32']:
-                # When FAT32 is expanded, show the space gained instead of "free space"
-                # (which will be near zero since FAT32 fills the disk)
-                space_gained = dst_fat - src_fat
-                msg += f"Space Reclaimed and Added to FAT32: {space_gained} MB"
-            else:
-                # When FAT32 is not expanded, show the actual free space
-                msg += f"Free Space After Cleanup: {self.target_layout.get_free_space_mb()} MB"
+            msg += f"\nSD Card: {self.source_disk['size_gb']:.1f} GB"
 
             self.show_custom_info("Cleanup Summary", msg, width=550, height=380)
 
