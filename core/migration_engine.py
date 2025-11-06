@@ -1211,8 +1211,8 @@ rescan
                 else:
                     logger.debug(f"Robocopy output: {line}")
 
-            # Wait for process to complete
-            process.wait(timeout=3600)
+            # Wait for process to complete (no timeout - large migrations can take hours)
+            process.wait()
 
             # Stop monitor thread
             monitor_running[0] = False
@@ -1249,10 +1249,6 @@ rescan
             self._report_progress(stage_name, base_progress + 60,
                                 f"Copied {files_copied} files in {elapsed_time:.0f}s")
 
-        except subprocess.TimeoutExpired:
-            logger.error("Robocopy timed out after 1 hour")
-            process.kill()
-            raise Exception("File copy timed out")
         except Exception as e:
             logger.error(f"Robocopy error: {e}")
             raise
