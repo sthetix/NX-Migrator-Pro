@@ -494,11 +494,11 @@ class MigrationEngine:
             logger.info(f"Source FAT32 is mounted as {source_drive_letter}")
             self._report_progress(stage_name, base_progress + 8, f"Source: {source_drive_letter}")
 
-            # Step 4: Copy files using robocopy (faster and more reliable than Python shutil)
+            # Step 4: Copy files using simple Python copy
             logger.info(f"Copying files from {source_drive_letter} to {target_drive_letter}...")
             self._report_progress(stage_name, base_progress + 10, "Copying files...")
 
-            self._copy_files_robocopy(
+            self._copy_files_simple(
                 source_drive_letter,
                 target_drive_letter,
                 stage_name,
@@ -761,6 +761,10 @@ assign
 
         logger.info(f"FAT32 filesystem created successfully with fat32format.exe")
         logger.info(f"Drive letter {self.target_fat32_drive} is locked for this migration")
+        
+        # CRITICAL: Verify FAT32 boot sector has correct partition size
+        # Without this, Windows may see incorrect filesystem size and report "disk full" prematurely
+        self._verify_and_fix_fat32_bpb(partition)
 
     def _verify_and_fix_fat32_bpb(self, partition):
         """
@@ -1068,6 +1072,70 @@ rescan
 
         except Exception as e:
             logger.warning(f"Could not refresh disk partitions: {e}")
+
+    def _copy_files_simple(self, source_drive, target_drive, stage_name, base_progress):
+        """Copy files using simple Python shutil - more reliable than robocopy"""
+        import os
+        from pathlib import Path
+        
+        source = Path(source_drive.rstrip(':\\'))
+        target = Path(target_drive.rstrip(':\\'))
+        
+        logger.info(f"Starting file copy: {source} -> {target}")
+        
+        start_time = time.time()
+        files_copied = 0
+        bytes_copied = 0
+        
+        try:
+            # Walk through source directory
+            for root, dirs, files in os.walk(source):
+                # Calculate relative path
+                rel_path = Path(root).relative_to(source)
+                target_dir = target / rel_path
+                
+                # Create target directory if it doesn't exist
+                target_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Copy each file
+                for file in files:
+                    if self.cancelled:
+                        raise Exception("Migration cancelled by user")
+                    
+                    source_file = Path(root) / file
+                    target_file = target_dir / file
+                    
+                    try:
+                        # Copy file
+                        shutil.copy2(source_file, target_file)
+                        files_copied += 1
+                        bytes_copied += source_file.stat().st_size
+                        
+                        # Update progress every 10 files
+                        if files_copied % 10 == 0:
+                            elapsed = time.time() - start_time
+                            speed_mbps = (bytes_copied / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                            logger.info(f"Copied {files_copied} files, {bytes_copied / (1024**3):.2f} GB at {speed_mbps:.1f} MB/s")
+                            self._report_progress(stage_name, base_progress + 10, 
+                                                f"Copied {files_copied} files...")
+                    except Exception as e:
+                        logger.error(f"Failed to copy {source_file}: {e}")
+                        raise
+            
+            elapsed_time = time.time() - start_time
+            mb_copied = bytes_copied / (1024 * 1024)
+            speed_mbps = mb_copied / elapsed_time if elapsed_time > 0 else 0
+            
+            logger.info(f"File copy completed successfully in {elapsed_time:.1f} seconds")
+            logger.info(f"Files copied: {files_copied}")
+            logger.info(f"Data copied: {mb_copied:.1f} MB at {speed_mbps:.1f} MB/s")
+            
+            self._report_progress(stage_name, base_progress + 60,
+                                f"Copied {files_copied} files in {elapsed_time:.0f}s")
+            
+        except Exception as e:
+            logger.error(f"File copy error: {e}")
+            raise
 
     def _copy_files_robocopy(self, source_drive, target_drive, stage_name, base_progress):
         """Copy files using robocopy with progress tracking"""
