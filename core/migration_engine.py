@@ -1404,14 +1404,18 @@ rescan
             gpt_header_to_write = None
             gpt_entries_to_write = None
 
-            # STEP 1: Try to read GPT from SOURCE emuMMC at offset 0xC001
-            # GPT structure: Header (1 sector) + Partition Entries (32 sectors) = 33 sectors total
+            # STEP 1: Read GPT from SOURCE emuMMC at physical sector (partition + 0x8000 + 0xC001 = +0x14001)
+            # Hekate places BOOT0 at (MBR start + 0x8000). GPT is BOOT0-relative +0xC001.
+            # Therefore physical GPT header sector = partition_start + 0x14001.
+            # Partition entries follow for 32 sectors.
             if source_emummc:
-                source_gpt_sector = source_emummc.start_sector + 0xC001
-                logger.info(f"Step 1: Reading GPT from SOURCE emuMMC at sector {source_gpt_sector} (0x{source_gpt_sector:X})")
+                EMUMMC_PROTECTIVE_OFFSET = 0x8000
+                GPT_RELATIVE_OFFSET = 0xC001
+                physical_gpt_offset = EMUMMC_PROTECTIVE_OFFSET + GPT_RELATIVE_OFFSET  # 0x14001
+                source_gpt_sector = source_emummc.start_sector + physical_gpt_offset
+                logger.info(f"Step 1: Reading GPT from SOURCE emuMMC at physical sector {source_gpt_sector} (0x{source_gpt_sector:X})")
 
                 try:
-                    # Read GPT header (1 sector)
                     source_gpt_data = self.disk_manager.read_sectors(
                         self.source_disk['path'],
                         source_gpt_sector,
@@ -1419,12 +1423,12 @@ rescan
                     )
 
                     if source_gpt_data[:8] == b'EFI PART':
-                        logger.info("✓ Found valid EFI signature in SOURCE at offset 0xC001")
+                        logger.info("✓ Found valid EFI signature in SOURCE at physical offset 0x14001")
                         gpt_header_to_write = source_gpt_data
-                        detected_offset = 0xC001
-                        
-                        # Also read the GPT partition entries (32 sectors after header)
-                        logger.info("Reading GPT partition entries from source...")
+                        detected_offset = physical_gpt_offset  # Store physical offset from partition start
+
+                        # Read GPT partition entries (32 sectors after header)
+                        logger.info("Reading GPT partition entries from source (32 sectors)...")
                         gpt_entries_to_write = self.disk_manager.read_sectors(
                             self.source_disk['path'],
                             source_gpt_sector + 1,
@@ -1432,38 +1436,12 @@ rescan
                         )
                         logger.info(f"✓ Read {len(gpt_entries_to_write)} bytes of GPT partition entries")
                     else:
-                        logger.info("✗ No EFI signature in source at 0xC001, trying 0x4001...")
-
-                        # Try offset 0x4001 (resized emuMMC)
-                        source_gpt_sector_alt = source_emummc.start_sector + 0x4001
-                        source_gpt_data_alt = self.disk_manager.read_sectors(
-                            self.source_disk['path'],
-                            source_gpt_sector_alt,
-                            1
-                        )
-
-                        if source_gpt_data_alt[:8] == b'EFI PART':
-                            logger.info("✓ Found valid EFI signature in SOURCE at offset 0x4001")
-                            gpt_header_to_write = source_gpt_data_alt
-                            detected_offset = 0x4001
-                            
-                            # Also read the GPT partition entries (32 sectors after header)
-                            logger.info("Reading GPT partition entries from source...")
-                            gpt_entries_to_write = self.disk_manager.read_sectors(
-                                self.source_disk['path'],
-                                source_gpt_sector_alt + 1,
-                                32
-                            )
-                            logger.info(f"✓ Read {len(gpt_entries_to_write)} bytes of GPT partition entries")
-                        else:
-                            logger.info("✗ No EFI signature in source at 0x4001 either")
-                            # No GPT found - try to detect actual BOOT0 location by searching for MBR
-                            logger.info("Step 1.5: Searching for emuMMC structure (MBR) to detect offset...")
-                            detected_offset = self._detect_emummc_offset_by_mbr(source_emummc.start_sector)
-                            logger.info(f"Detected offset from MBR search: 0x{detected_offset:X}")
+                        logger.info("✗ No EFI signature at expected physical GPT offset 0x14001; attempting MBR heuristic...")
+                        detected_offset = self._detect_emummc_offset_by_mbr(source_emummc.start_sector)
+                        logger.info(f"Detected offset from MBR heuristic: 0x{detected_offset:X}")
 
                 except Exception as e:
-                    logger.warning(f"Could not read from source emuMMC: {e}")
+                    logger.warning(f"Could not read GPT header from source emuMMC: {e}")
             
             # Store the detected offset for later use in emummc.ini calculation
             self.detected_emummc_offset = detected_offset
@@ -1503,8 +1481,9 @@ rescan
 
             # STEP 3: If still not found, create minimal valid GPT header
             if not gpt_header_to_write:
-                logger.info("Step 3: Creating minimal valid GPT header for hekate detection...")
-                gpt_header_to_write = self._create_minimal_gpt_header()
+                logger.info("Step 3: Creating minimal valid GPT header for hekate detection (dynamic size)...")
+                # Use target partition size to build dynamic GPT (emuMMC total sectors)
+                gpt_header_to_write = self._create_minimal_gpt_header(emummc_partition.size_sectors)
 
             # STEP 4: Write GPT header to target at detected offset
             target_gpt_sector = target_partition_start + detected_offset
@@ -1592,7 +1571,7 @@ rescan
         logger.warning("Could not detect offset from MBR - defaulting to 0xC001")
         return 0xC001
 
-    def _create_minimal_gpt_header(self) -> bytes:
+    def _create_minimal_gpt_header(self, emummc_partition_sectors: int, protective_offset: int = 0x8000) -> bytes:
         """
         Create a minimal valid GPT header for Nintendo Switch emuMMC
         This is based on the standard GPT specification and what hekate expects.
@@ -1627,18 +1606,23 @@ rescan
         # This is the LBA within the emuMMC "disk", not the SD card absolute sector
         header[24:32] = struct.pack('<Q', 0xC001)
 
-        # Offset 32-39: Backup LBA (location of backup header)
-        # For a 29.1 GB eMMC USER partition: ~60,817,408 sectors
-        # Backup GPT is at last sector, but we'll use a safe value
-        header[32:40] = struct.pack('<Q', 0x1B4E000)  # Approximate Switch eMMC size in sectors
+        # Compute logical USER region size (exclude protective gap before BOOT0)
+        # emummc_partition_sectors includes protective area; logical usable begins after protective_offset.
+        logical_sectors = max(0, emummc_partition_sectors - protective_offset)
+        # Backup GPT LBA = last sector of logical region (relative to BOOT0 start)
+        # We keep values relative to the emuMMC "disk" whose LBA 0 = BOOT0 start + (C000 - protective_offset) nuance
+        # For minimal compatibility we set alt_lba to logical_sectors - 1 if large enough, else a safe minimum.
+        alt_lba = logical_sectors - 1 if logical_sectors > 34 else 34
+        header[32:40] = struct.pack('<Q', alt_lba)
 
         # Offset 40-47: First usable LBA for partitions = 34
         # (1 MBR + 1 GPT header + 32 sectors for partition entries)
         # This is relative to the emuMMC "disk", so it's from the start of the USER partition (0xC000)
         header[40:48] = struct.pack('<Q', 0xC000 + 34)
 
-        # Offset 48-55: Last usable LBA
-        header[48:56] = struct.pack('<Q', 0x1B4DFE0)  # Backup GPT location - 33
+        # Offset 48-55: Last usable LBA (one before backup header minus 33 for entries/header space)
+        last_use_lba = alt_lba - 33 if alt_lba > 33 else alt_lba
+        header[48:56] = struct.pack('<Q', last_use_lba)
 
         # Offset 56-71: Disk GUID (16 bytes, random)
         # Use a recognizable pattern for NXMigratorPro: "NXMigratorProGPT"
@@ -1667,11 +1651,13 @@ rescan
         header_crc = zlib.crc32(bytes(header[0:92])) & 0xFFFFFFFF
         header[16:20] = struct.pack('<I', header_crc)
 
-        logger.info("Created minimal GPT header:")
+        logger.info("Created minimal GPT header (dynamic):")
         logger.info(f"  Signature: {header[0:8]}")
         logger.info(f"  Revision: 1.0")
         logger.info(f"  Header CRC32: 0x{header_crc:08X}")
         logger.info(f"  Disk GUID: {disk_guid}")
+        logger.info(f"  Alt LBA (backup): {alt_lba}")
+        logger.info(f"  Last usable LBA: {last_use_lba}")
 
         return bytes(header)
 
