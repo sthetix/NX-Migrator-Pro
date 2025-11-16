@@ -1638,22 +1638,39 @@ rescan
             #   0x4000 - 0xBFFF: Protective gap (16 MB)
             #   0xC000 onwards:  USER eMMC (main data, ~29 GB)
             #
-            # Hekate's emuMMC layout:
-            #   - emuMMC data structure starts with BOOT0 at offset 0x8000 (16MB) from partition start
-            #   - emummc.ini sector points to where BOOT0 begins
+            # Hekate's emuMMC sector calculation:
+            #   Based on hekate source code analysis and testing:
+            #   1. Start with 0x8000 (16MB protective offset)
+            #   2. Add MBR partition start sector
+            #   3. Round UP to 32MB (0x10000) alignment
             #
-            # The 0x8000 offset (32768 sectors = 16 MB):
-            #   Verified from Hekate-created 1TB card: partition@0x76B08000, sector=0x76B10000
+            # From hekate source (gui_emummc_tools.c line 164):
+            #   mbr_ctx.sector_start = 0x8000; // Protective offset
+            #   then adds partition starts
+            #
+            # From testing:
+            #   1TB card: partition@0x76B05800, hekate assigned sector=0x76B10000
+            #   Calculation: 0x8000 + 0x76B05800 = 0x76B0D800
+            #   Rounded to 0x10000: 0x76B10000 (matches!)
 
-            # Hekate's fixed offset: emummc.ini sector = partition start + 0x8000
-            EMUMMC_INI_OFFSET = 0x8000  # 32768 sectors = 16 MB
+            BASE_OFFSET = 0x8000  # 16MB protective offset
+            ALIGNMENT = 0x10000   # 32MB alignment (hekate Fix RAW uses this)
 
-            # Calculate the sector value for emummc.ini and raw_based
-            emummc_ini_sector = target_emummc_gpt_start + EMUMMC_INI_OFFSET
+            # Get MBR partition start (convert from GPT if needed)
+            # For MBR-only disks, GPT start == MBR start
+            mbr_partition_start = target_emummc_gpt_start
+
+            # Calculate sector before alignment
+            unaligned_sector = BASE_OFFSET + mbr_partition_start
+
+            # Round UP to 32MB (0x10000) alignment - this is what hekate "Fix RAW" does
+            emummc_ini_sector = ((unaligned_sector + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT
 
             logger.info(f"emuMMC sector calculation:")
-            logger.info(f"  GPT partition start: 0x{target_emummc_gpt_start:X} ({target_emummc_gpt_start:,})")
-            logger.info(f"  emummc.ini sector: GPT + 0x{EMUMMC_INI_OFFSET:X} = 0x{emummc_ini_sector:X} ({emummc_ini_sector:,})")
+            logger.info(f"  MBR partition start: 0x{mbr_partition_start:X} ({mbr_partition_start:,})")
+            logger.info(f"  Base offset (0x8000): + {BASE_OFFSET:,} sectors")
+            logger.info(f"  Unaligned sector: 0x{unaligned_sector:X} ({unaligned_sector:,})")
+            logger.info(f"  Aligned to 0x{ALIGNMENT:X} (32MB): 0x{emummc_ini_sector:X} ({emummc_ini_sector:,})")
 
             # Determine which RAW folder to use (RAW1, RAW2, or RAW3)
             # Based on which MBR partition the emuMMC is in

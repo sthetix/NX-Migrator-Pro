@@ -415,6 +415,10 @@ class PartitionScanner:
         )
         target_layout.add_partition(fat32_part)
         current_lba += fat32_sectors
+        
+        # Align to 32768 sectors (16MB) after FAT32
+        if current_lba % ALIGN_SECTORS != 0:
+            current_lba = ((current_lba + ALIGN_SECTORS - 1) // ALIGN_SECTORS) * ALIGN_SECTORS
 
         # 2. Linux (if migrating)
         if source_layout.has_linux and options['migrate_linux']:
@@ -434,6 +438,10 @@ class PartitionScanner:
             )
             target_layout.add_partition(linux_part)
             current_lba += linux_sectors
+            
+            # Align to 32768 sectors (16MB) after Linux
+            if current_lba % ALIGN_SECTORS != 0:
+                current_lba = ((current_lba + ALIGN_SECTORS - 1) // ALIGN_SECTORS) * ALIGN_SECTORS
 
         # 3. Android (if migrating) - recreate all Android partitions
         if source_layout.has_android and options['migrate_android']:
@@ -452,6 +460,10 @@ class PartitionScanner:
                 )
                 target_layout.add_partition(new_apart)
                 current_lba += apart.size_sectors
+            
+            # Align to 32768 sectors (16MB) after Android partitions
+            if current_lba % ALIGN_SECTORS != 0:
+                current_lba = ((current_lba + ALIGN_SECTORS - 1) // ALIGN_SECTORS) * ALIGN_SECTORS
 
         # 4. emuMMC (if migrating)
         if source_layout.has_emummc and options['migrate_emummc']:

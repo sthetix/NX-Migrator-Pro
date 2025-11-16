@@ -334,13 +334,18 @@ class CleanupEngine:
             emummc_path = base_path / "emuMMC"
             emummc_path.mkdir(exist_ok=True)
 
-            # Calculate emuMMC sector offset
+            # Calculate emuMMC sector offset using same logic as migration_engine
             target_emummc_gpt_start = target_emummc[0].start_sector
-            EMUMMC_INI_OFFSET = 0x8000  # Hekate's standard offset (32768 sectors = 16 MB)
-            emummc_ini_sector = target_emummc_gpt_start + EMUMMC_INI_OFFSET
+            
+            BASE_OFFSET = 0x8000   # 16MB protective offset
+            ALIGNMENT = 0x10000    # 32MB alignment (hekate Fix RAW uses this)
+            
+            mbr_partition_start = target_emummc_gpt_start
+            unaligned_sector = BASE_OFFSET + mbr_partition_start
+            emummc_ini_sector = ((unaligned_sector + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT
 
-            logger.info(f"emuMMC GPT start: 0x{target_emummc_gpt_start:X}")
-            logger.info(f"emuMMC ini sector: 0x{emummc_ini_sector:X}")
+            logger.info(f"emuMMC MBR partition start: 0x{target_emummc_gpt_start:X}")
+            logger.info(f"emuMMC ini sector (aligned to 32MB): 0x{emummc_ini_sector:X}")
 
             # Create RAW folder
             raw_folder_name = "RAW1"
