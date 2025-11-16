@@ -1436,6 +1436,10 @@ rescan
                             detected_offset = 0x4001
                         else:
                             logger.info("✗ No EFI signature in source at 0x4001 either")
+                            # No GPT found - try to detect actual BOOT0 location by searching for MBR
+                            logger.info("Step 1.5: Searching for emuMMC structure (MBR) to detect offset...")
+                            detected_offset = self._detect_emummc_offset_by_mbr(source_emummc.start_sector)
+                            logger.info(f"Detected offset from MBR search: 0x{detected_offset:X}")
 
                 except Exception as e:
                     logger.warning(f"Could not read from source emuMMC: {e}")
@@ -1504,6 +1508,56 @@ rescan
             # Don't fail the migration, just log the error
             return 0xC001  # Return default offset
 
+    def _detect_emummc_offset_by_mbr(self, partition_start_sector: int) -> int:
+        """
+        Detect emuMMC offset by searching for the MBR signature (0x55AA) at known offsets.
+        
+        emuMMC structure:
+        - BOOT0 (0x2000 sectors = 4MB)
+        - BOOT1 (0x2000 sectors = 4MB)
+        - Protective gap (varies: 0x8000 or 0x4000 sectors)
+        - MBR at offset 0xC000 or 0x8000 from BOOT0 start
+        - GPT at offset 0xC001 or 0x4001 from BOOT0 start (if exists)
+        
+        Returns: Detected offset (0x0, 0x4001, or 0xC001)
+        """
+        logger.info(f"Searching for MBR in emuMMC partition starting at sector {partition_start_sector}...")
+        
+        # Offsets to check for MBR (sector 0xC000 or 0x8000 relative to BOOT0)
+        # MBR is always 1 sector before GPT
+        possible_offsets = [
+            (0xC000, 0xC001, "BOOT0 at partition start (MBR at +0xC000)"),
+            (0x8000, 0x8001, "BOOT0 at +0x4000 (MBR at partition +0x8000)"),  # Resized with smaller gap
+        ]
+        
+        for mbr_offset, gpt_offset, description in possible_offsets:
+            try:
+                # Read the sector where MBR should be
+                mbr_sector = partition_start_sector + mbr_offset
+                logger.info(f"  Checking MBR at offset 0x{mbr_offset:X} ({description})...")
+                
+                mbr_data = self.disk_manager.read_sectors(
+                    self.source_disk['path'],
+                    mbr_sector,
+                    1
+                )
+                
+                # Check for MBR signature 0x55AA at offset 510-511
+                if len(mbr_data) >= 512 and mbr_data[510:512] == b'\x55\xAA':
+                    logger.info(f"  ✓ Found MBR signature at offset 0x{mbr_offset:X}")
+                    logger.info(f"  → BOOT0 is at partition start + 0x{gpt_offset:X}")
+                    return gpt_offset
+                else:
+                    logger.info(f"  ✗ No MBR signature at offset 0x{mbr_offset:X}")
+                    
+            except Exception as e:
+                logger.warning(f"  Error reading MBR at offset 0x{mbr_offset:X}: {e}")
+                continue
+        
+        # If nothing found, return default
+        logger.warning("Could not detect offset from MBR - defaulting to 0xC001")
+        return 0xC001
+
     def _create_minimal_gpt_header(self) -> bytes:
         """
         Create a minimal valid GPT header for Nintendo Switch emuMMC
@@ -1534,20 +1588,20 @@ rescan
         # Offset 20-23: Reserved (must be zero)
         header[20:24] = struct.pack('<I', 0)
 
-        # Offset 24-31: Current LBA (location of this header) = 1
-        # In emuMMC context, this is relative to the USER partition start (0xC000)
-        # So the GPT header is at sector 1 of the USER partition
-        header[24:32] = struct.pack('<Q', 1)
+        # Offset 24-31: Current LBA (location of this header)
+        # In emuMMC context, GPT is at sector 0xC001 relative to BOOT0
+        # This is the LBA within the emuMMC "disk", not the SD card absolute sector
+        header[24:32] = struct.pack('<Q', 0xC001)
 
         # Offset 32-39: Backup LBA (location of backup header)
         # For a 29.1 GB eMMC USER partition: ~60,817,408 sectors
         # Backup GPT is at last sector, but we'll use a safe value
-        # Since we don't know exact size, use 0xFFFFFFFFFFFFFFFF to indicate "end of disk"
         header[32:40] = struct.pack('<Q', 0x1B4E000)  # Approximate Switch eMMC size in sectors
 
         # Offset 40-47: First usable LBA for partitions = 34
         # (1 MBR + 1 GPT header + 32 sectors for partition entries)
-        header[40:48] = struct.pack('<Q', 34)
+        # This is relative to the emuMMC "disk", so it's from the start of the USER partition (0xC000)
+        header[40:48] = struct.pack('<Q', 0xC000 + 34)
 
         # Offset 48-55: Last usable LBA
         header[48:56] = struct.pack('<Q', 0x1B4DFE0)  # Backup GPT location - 33
@@ -1558,7 +1612,8 @@ rescan
         header[56:72] = disk_guid
 
         # Offset 72-79: Starting LBA of partition entries = 2
-        header[72:80] = struct.pack('<Q', 2)
+        # Partition entries start right after GPT header (0xC001 + 1 = 0xC002)
+        header[72:80] = struct.pack('<Q', 0xC002)
 
         # Offset 80-83: Number of partition entries
         # Standard is 128, but we'll use minimum needed for Switch (around 32)
@@ -1671,31 +1726,34 @@ rescan
 
             # Calculate the emummc.ini sector based on how hekate structures emuMMC
             #
-            # Hekate's emuMMC structure (when creating from scratch):
-            #   - Clears 16MB (0x8000 sectors) before sector_start
-            #   - Writes BOOT0/BOOT1/USER starting AT sector_start
-            #   - sector_start = partition_start + 0x8000
-            #   - GPT is at sector_start + 0xC001
+            # Hekate's emuMMC structure (standard layout):
+            #   - Partition start (MBR entry)
+            #   - +0x0000: Reserved/padding (cleared by hekate)
+            #   - +0x8000: BOOT0 starts HERE (16MB offset) ← emummc.ini sector points here
+            #   - +0xA000: BOOT1 (4MB after BOOT0)
+            #   - +0xC000: USER partition MBR  
+            #   - +0xC001: USER partition GPT header
             #
-            # When bit-by-bit copying existing emuMMC:
-            #   - The internal structure is preserved as-is
-            #   - GPT offset from partition start tells us where BOOT0 actually is
-            #   - If GPT is at partition + 0xC001, then BOOT0 is at partition + 0 (0xC001 - 0xC001 = 0)
-            #   - If GPT is at partition + 0x14001, then BOOT0 is at partition + 0x8000 (0x14001 - 0xC001 = 0x8000)
+            # Hekate ALWAYS expects emummc.ini sector to point to partition_start + 0x8000,
+            # regardless of how the emuMMC was created. This is because:
+            #   1. Hekate's "Fix RAW" rewrites it to partition + 0x8000
+            #   2. The emuMMC structure has a 16MB protective offset before BOOT0
+            #   3. Even when bit-by-bit copying, the internal offsets are preserved
             #
-            # The sector in emummc.ini should point to where BOOT0 actually starts.
+            # When we do bit-by-bit copy from source, we copy the ENTIRE partition including
+            # the 16MB protective offset, so BOOT0 ends up at target_partition + 0x8000.
             
-            # GPT is always 0xC001 sectors after BOOT0 start
-            GPT_OFFSET_FROM_BOOT0 = 0xC001
+            # Hekate's standard offset for BOOT0 within the emuMMC partition
+            HEKATE_BOOT0_OFFSET = 0x8000
             
-            # Calculate where BOOT0 starts based on detected GPT location
-            boot0_start_sector = mbr_partition_start + detected_offset - GPT_OFFSET_FROM_BOOT0
+            # Calculate the correct sector for emummc.ini
+            boot0_start_sector = mbr_partition_start + HEKATE_BOOT0_OFFSET
             emummc_ini_sector = boot0_start_sector
 
             logger.info(f"emuMMC sector calculation:")
             logger.info(f"  MBR partition start: 0x{mbr_partition_start:X} ({mbr_partition_start:,})")
-            logger.info(f"  GPT detected at offset: 0x{detected_offset:X} ({detected_offset:,} sectors from partition start)")
-            logger.info(f"  BOOT0 starts at: 0x{boot0_start_sector:X} ({boot0_start_sector:,})")
+            logger.info(f"  Hekate standard BOOT0 offset: 0x{HEKATE_BOOT0_OFFSET:X} ({HEKATE_BOOT0_OFFSET:,} sectors)")
+            logger.info(f"  BOOT0 location: 0x{boot0_start_sector:X} ({boot0_start_sector:,})")
             logger.info(f"  Final sector for emummc.ini: 0x{emummc_ini_sector:X} ({emummc_ini_sector:,})")
 
             # Determine which RAW folder to use (RAW1, RAW2, or RAW3)
