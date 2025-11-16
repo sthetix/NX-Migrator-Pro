@@ -1598,57 +1598,57 @@ rescan
         switch_partitions = [
             # PRODINFO - 8MB (0x0 - 0x3FFF)
             ("PRODINFO", 
-             bytes.fromhex("00007e ca11 0000 0000 0000 0050 524f 4449"),  # Type GUID for PRODINFO
+             bytes.fromhex("00007eca1100000000000050524f4449"),  # Type GUID for PRODINFO
              0x00, 0x003FFF, 0x0000000000000000),
             
             # PRODINFOF - 8MB (0x4000 - 0x7FFF) 
             ("PRODINFOF",
-             bytes.fromhex("00007e ca11 0000 0000 0000 0050 524f 4446"),  # Type GUID for PRODINFOF
+             bytes.fromhex("00007eca1100000000000050524f4446"),  # Type GUID for PRODINFOF
              0x004000, 0x007FFF, 0x0000000000000000),
             
             # BCPKG2-1-Normal-Main - 128MB (0x8000 - 0x47FFF)
             ("BCPKG2-1-Normal-Main",
-             bytes.fromhex("00007e ca11 0000 0000 0000 0042 4350 4b31"),  # Type GUID for BCPKG2-1
+             bytes.fromhex("00007eca110000000000004243504b31"),  # Type GUID for BCPKG2-1
              0x008000, 0x047FFF, 0x0000000000000000),
             
             # BCPKG2-2-Normal-Sub - 128MB (0x48000 - 0x87FFF)
             ("BCPKG2-2-Normal-Sub",
-             bytes.fromhex("00007e ca11 0000 0000 0000 0042 4350 4b32"),  # Type GUID for BCPKG2-2
+             bytes.fromhex("00007eca110000000000004243504b32"),  # Type GUID for BCPKG2-2
              0x048000, 0x087FFF, 0x0000000000000000),
             
             # BCPKG2-3-SafeMode-Main - 128MB (0x88000 - 0xC7FFF)
             ("BCPKG2-3-SafeMode-Main",
-             bytes.fromhex("00007e ca11 0000 0000 0000 0042 4350 4b33"),  # Type GUID for BCPKG2-3
+             bytes.fromhex("00007eca110000000000004243504b33"),  # Type GUID for BCPKG2-3
              0x088000, 0x0C7FFF, 0x0000000000000000),
             
             # BCPKG2-4-SafeMode-Sub - 128MB (0xC8000 - 0x107FFF)
             ("BCPKG2-4-SafeMode-Sub",
-             bytes.fromhex("00007e ca11 0000 0000 0000 0042 4350 4b34"),  # Type GUID for BCPKG2-4
+             bytes.fromhex("00007eca110000000000004243504b34"),  # Type GUID for BCPKG2-4
              0x0C8000, 0x107FFF, 0x0000000000000000),
             
             # BCPKG2-5-Repair-Main - 128MB (0x108000 - 0x147FFF)
             ("BCPKG2-5-Repair-Main",
-             bytes.fromhex("00007e ca11 0000 0000 0000 0042 4350 4b35"),  # Type GUID for BCPKG2-5
+             bytes.fromhex("00007eca110000000000004243504b35"),  # Type GUID for BCPKG2-5
              0x108000, 0x147FFF, 0x0000000000000000),
             
             # BCPKG2-6-Repair-Sub - 128MB (0x148000 - 0x187FFF)
             ("BCPKG2-6-Repair-Sub",
-             bytes.fromhex("00007e ca11 0000 0000 0000 0042 4350 4b36"),  # Type GUID for BCPKG2-6
+             bytes.fromhex("00007eca110000000000004243504b36"),  # Type GUID for BCPKG2-6
              0x148000, 0x187FFF, 0x0000000000000000),
             
             # SAFE - 288MB (0x188000 - 0x1CBFFF)
             ("SAFE",
-             bytes.fromhex("00007e ca11 0000 0000 0000 0053 4146 4500"),  # Type GUID for SAFE
+             bytes.fromhex("00007eca110000000000005341464500"),  # Type GUID for SAFE
              0x188000, 0x1CBFFF, 0x0000000000000000),
             
             # SYSTEM - ~2GB (0x1CC000 - 0x9CBFFF)
             ("SYSTEM",
-             bytes.fromhex("00007e ca11 0000 0000 0000 0053 5953 5445"),  # Type GUID for SYSTEM
+             bytes.fromhex("00007eca110000000000005359535445"),  # Type GUID for SYSTEM
              0x1CC000, 0x9CBFFF, 0x0000000000000000),
             
             # USER - varies by console, typically ~13.5-26GB (0x9CC000 - 0x1D3FFFF for 29GB)
             ("USER",
-             bytes.fromhex("00007e ca11 0000 0000 0000 0055 5345 5200"),  # Type GUID for USER
+             bytes.fromhex("00007eca110000000000005553455200"),  # Type GUID for USER
              0x9CC000, 0x1D3FFFF, 0x0000000000000000),
         ]
         

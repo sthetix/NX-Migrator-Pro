@@ -1179,8 +1179,7 @@ For more help:
     def _open_github_issues(self):
         """Open GitHub issues page"""
         try:
-            # Update this URL to your actual GitHub repository
-            webbrowser.open('https://github.com/yourusername/nx-migrator-pro/issues')
+            webbrowser.open('https://github.com/sthetix/NANDFixPro/issues')
         except Exception as e:
             self.show_custom_info(
                 "Error",
