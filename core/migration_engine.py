@@ -1669,12 +1669,33 @@ rescan
             # Get MBR partition start
             mbr_partition_start = target_emummc_gpt_start
 
-            # Use the detected offset (0xC001 or 0x4001) from the source emuMMC
-            emummc_ini_sector = mbr_partition_start + detected_offset
+            # Calculate the emummc.ini sector based on how hekate structures emuMMC
+            #
+            # Hekate's emuMMC structure (when creating from scratch):
+            #   - Clears 16MB (0x8000 sectors) before sector_start
+            #   - Writes BOOT0/BOOT1/USER starting AT sector_start
+            #   - sector_start = partition_start + 0x8000
+            #   - GPT is at sector_start + 0xC001
+            #
+            # When bit-by-bit copying existing emuMMC:
+            #   - The internal structure is preserved as-is
+            #   - GPT offset from partition start tells us where BOOT0 actually is
+            #   - If GPT is at partition + 0xC001, then BOOT0 is at partition + 0 (0xC001 - 0xC001 = 0)
+            #   - If GPT is at partition + 0x14001, then BOOT0 is at partition + 0x8000 (0x14001 - 0xC001 = 0x8000)
+            #
+            # The sector in emummc.ini should point to where BOOT0 actually starts.
+            
+            # GPT is always 0xC001 sectors after BOOT0 start
+            GPT_OFFSET_FROM_BOOT0 = 0xC001
+            
+            # Calculate where BOOT0 starts based on detected GPT location
+            boot0_start_sector = mbr_partition_start + detected_offset - GPT_OFFSET_FROM_BOOT0
+            emummc_ini_sector = boot0_start_sector
 
             logger.info(f"emuMMC sector calculation:")
             logger.info(f"  MBR partition start: 0x{mbr_partition_start:X} ({mbr_partition_start:,})")
-            logger.info(f"  Detected offset (from source): 0x{detected_offset:X} ({detected_offset:,} sectors)")
+            logger.info(f"  GPT detected at offset: 0x{detected_offset:X} ({detected_offset:,} sectors from partition start)")
+            logger.info(f"  BOOT0 starts at: 0x{boot0_start_sector:X} ({boot0_start_sector:,})")
             logger.info(f"  Final sector for emummc.ini: 0x{emummc_ini_sector:X} ({emummc_ini_sector:,})")
 
             # Determine which RAW folder to use (RAW1, RAW2, or RAW3)
