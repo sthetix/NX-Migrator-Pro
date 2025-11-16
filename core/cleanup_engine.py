@@ -336,7 +336,7 @@ class CleanupEngine:
 
             # Calculate emuMMC sector offset
             target_emummc_gpt_start = target_emummc[0].start_sector
-            EMUMMC_INI_OFFSET = 0x17000
+            EMUMMC_INI_OFFSET = 0x8000  # Hekate's standard offset (32768 sectors = 16 MB)
             emummc_ini_sector = target_emummc_gpt_start + EMUMMC_INI_OFFSET
 
             logger.info(f"emuMMC GPT start: 0x{target_emummc_gpt_start:X}")

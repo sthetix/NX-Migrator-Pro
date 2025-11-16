@@ -1077,11 +1077,26 @@ rescan
         """Copy files using simple Python shutil - more reliable than robocopy"""
         import os
         from pathlib import Path
-        
-        source = Path(source_drive.rstrip(':\\'))
-        target = Path(target_drive.rstrip(':\\'))
-        
+
+        # Ensure drive letters are properly formatted (e.g., "G:\" or "G:/")
+        # Don't strip the colon - only strip trailing backslashes
+        source = Path(source_drive.rstrip('\\') + '\\')
+        target = Path(target_drive.rstrip('\\') + '\\')
+
         logger.info(f"Starting file copy: {source} -> {target}")
+        logger.info(f"Checking if source exists and is accessible...")
+
+        # Verify source path exists and is accessible
+        if not source.exists():
+            raise Exception(f"Source path does not exist: {source}")
+
+        if not source.is_dir():
+            raise Exception(f"Source path is not a directory: {source}")
+
+        # Count total files first for better progress reporting
+        logger.info(f"Scanning source directory for files...")
+        total_files = sum(1 for root, dirs, files in os.walk(source) for file in files)
+        logger.info(f"Found {total_files} files to copy")
         
         start_time = time.time()
         files_copied = 0
@@ -1111,13 +1126,17 @@ rescan
                         files_copied += 1
                         bytes_copied += source_file.stat().st_size
                         
-                        # Update progress every 10 files
-                        if files_copied % 10 == 0:
+                        # Update progress every 10 files or every 100MB
+                        if files_copied % 10 == 0 or (bytes_copied // (100 * 1024 * 1024)) > ((bytes_copied - source_file.stat().st_size) // (100 * 1024 * 1024)):
                             elapsed = time.time() - start_time
                             speed_mbps = (bytes_copied / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                            logger.info(f"Copied {files_copied} files, {bytes_copied / (1024**3):.2f} GB at {speed_mbps:.1f} MB/s")
-                            self._report_progress(stage_name, base_progress + 10, 
-                                                f"Copied {files_copied} files...")
+                            percent_complete = (files_copied / total_files * 100) if total_files > 0 else 0
+                            logger.info(f"Copied {files_copied}/{total_files} files ({percent_complete:.1f}%), {bytes_copied / (1024**3):.2f} GB at {speed_mbps:.1f} MB/s")
+
+                            # Calculate progress within the FAT32 copy stage (10% to 85% of the stage)
+                            file_progress = (files_copied / total_files * 75) if total_files > 0 else 0
+                            self._report_progress(stage_name, base_progress + 10 + file_progress,
+                                                f"Copied {files_copied}/{total_files} files ({percent_complete:.0f}%)")
                     except Exception as e:
                         logger.error(f"Failed to copy {source_file}: {e}")
                         raise
@@ -1125,13 +1144,17 @@ rescan
             elapsed_time = time.time() - start_time
             mb_copied = bytes_copied / (1024 * 1024)
             speed_mbps = mb_copied / elapsed_time if elapsed_time > 0 else 0
-            
+
             logger.info(f"File copy completed successfully in {elapsed_time:.1f} seconds")
-            logger.info(f"Files copied: {files_copied}")
-            logger.info(f"Data copied: {mb_copied:.1f} MB at {speed_mbps:.1f} MB/s")
-            
-            self._report_progress(stage_name, base_progress + 60,
-                                f"Copied {files_copied} files in {elapsed_time:.0f}s")
+            logger.info(f"Files copied: {files_copied} of {total_files}")
+            logger.info(f"Data copied: {mb_copied:.1f} MB ({bytes_copied / (1024**3):.2f} GB) at {speed_mbps:.1f} MB/s")
+
+            if files_copied == 0:
+                logger.warning(f"No files were found in source directory: {source}")
+                logger.warning(f"The source FAT32 partition appears to be empty!")
+
+            self._report_progress(stage_name, base_progress + 85,
+                                f"✓ Copied {files_copied} files ({mb_copied:.0f} MB) in {elapsed_time:.0f}s")
             
         except Exception as e:
             logger.error(f"File copy error: {e}")
@@ -1615,19 +1638,15 @@ rescan
             #   0x4000 - 0xBFFF: Protective gap (16 MB)
             #   0xC000 onwards:  USER eMMC (main data, ~29 GB)
             #
-            # In a Hybrid MBR/GPT setup:
-            #   - GPT partition points to the actual start of the emuMMC data
-            #   - MBR partition points to GPT_start + 0xF000 (30 MB: includes BOOT0/1/gap internally)
-            #   - emummc.ini sector = GPT_start + 0x17000 (46 MB: MBR offset + 0x8000 protective)
-            #   - raw_based file = emummc.ini sector value
+            # Hekate's emuMMC layout:
+            #   - emuMMC data structure starts with BOOT0 at offset 0x8000 (16MB) from partition start
+            #   - emummc.ini sector points to where BOOT0 begins
             #
-            # The 0x17000 offset breakdown:
-            #   0xF000 (30 MB): MBR offset from GPT (BOOT0/1 + gap)
-            #   0x8000 (16 MB): Protective offset within MBR partition
-            #   Total: 0x17000 (46 MB)
+            # The 0x8000 offset (32768 sectors = 16 MB):
+            #   Verified from Hekate-created 1TB card: partition@0x76B08000, sector=0x76B10000
 
-            # Hekate's fixed offset: emummc.ini sector = GPT partition start + 0x17000
-            EMUMMC_INI_OFFSET = 0x17000  # 94208 sectors = 46 MB
+            # Hekate's fixed offset: emummc.ini sector = partition start + 0x8000
+            EMUMMC_INI_OFFSET = 0x8000  # 32768 sectors = 16 MB
 
             # Calculate the sector value for emummc.ini and raw_based
             emummc_ini_sector = target_emummc_gpt_start + EMUMMC_INI_OFFSET

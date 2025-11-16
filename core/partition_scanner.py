@@ -393,7 +393,7 @@ class PartitionScanner:
             # Calculate available space
             total_disk_mb = (target_layout.total_sectors * SECTOR_SIZE) // (1024 * 1024)
             start_alignment_mb = ALIGN_SECTORS // 2048  # 16MB starting alignment
-            end_reserve_mb = 31  # Reserve ~31MB at end (for GPT backup and padding, matching hekate)
+            end_reserve_mb = 9  # Reserve ~9MB at end (matching Hekate's layout)
             reserved_mb = total_reserved_mb + start_alignment_mb + end_reserve_mb
             fat32_size_mb = total_disk_mb - reserved_mb
         else:
