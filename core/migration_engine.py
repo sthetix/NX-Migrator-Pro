@@ -1555,11 +1555,13 @@ rescan
         """
         logger.info(f"Searching for MBR in emuMMC partition starting at sector {partition_start_sector}...")
         
-        # Offsets to check for MBR (sector 0xC000 or 0x8000 relative to BOOT0)
+        # Offsets to check for MBR (sector 0xC000 relative to BOOT0)
         # MBR is always 1 sector before GPT
+        # The MBR partition entry points to the start of the protective gap,
+        # so BOOT0 is at partition_start + 0x8000
         possible_offsets = [
-            (0xC000, 0xC001, "BOOT0 at partition start (MBR at +0xC000)"),
-            (0x8000, 0x8001, "BOOT0 at +0x4000 (MBR at partition +0x8000)"),  # Resized with smaller gap
+            (0x14000, 0x14001, "BOOT0 at partition +0x8000 (MBR at partition +0x14000, GPT at +0x14001)"),
+            (0xC000, 0xC001, "BOOT0 at partition start (MBR at partition +0xC000, GPT at +0xC001)"),
         ]
         
         for mbr_offset, gpt_offset, description in possible_offsets:
