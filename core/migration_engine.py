@@ -1402,13 +1402,16 @@ rescan
                     break
 
             gpt_header_to_write = None
+            gpt_entries_to_write = None
 
             # STEP 1: Try to read GPT from SOURCE emuMMC at offset 0xC001
+            # GPT structure: Header (1 sector) + Partition Entries (32 sectors) = 33 sectors total
             if source_emummc:
                 source_gpt_sector = source_emummc.start_sector + 0xC001
                 logger.info(f"Step 1: Reading GPT from SOURCE emuMMC at sector {source_gpt_sector} (0x{source_gpt_sector:X})")
 
                 try:
+                    # Read GPT header (1 sector)
                     source_gpt_data = self.disk_manager.read_sectors(
                         self.source_disk['path'],
                         source_gpt_sector,
@@ -1419,6 +1422,15 @@ rescan
                         logger.info("✓ Found valid EFI signature in SOURCE at offset 0xC001")
                         gpt_header_to_write = source_gpt_data
                         detected_offset = 0xC001
+                        
+                        # Also read the GPT partition entries (32 sectors after header)
+                        logger.info("Reading GPT partition entries from source...")
+                        gpt_entries_to_write = self.disk_manager.read_sectors(
+                            self.source_disk['path'],
+                            source_gpt_sector + 1,
+                            32
+                        )
+                        logger.info(f"✓ Read {len(gpt_entries_to_write)} bytes of GPT partition entries")
                     else:
                         logger.info("✗ No EFI signature in source at 0xC001, trying 0x4001...")
 
@@ -1434,6 +1446,15 @@ rescan
                             logger.info("✓ Found valid EFI signature in SOURCE at offset 0x4001")
                             gpt_header_to_write = source_gpt_data_alt
                             detected_offset = 0x4001
+                            
+                            # Also read the GPT partition entries (32 sectors after header)
+                            logger.info("Reading GPT partition entries from source...")
+                            gpt_entries_to_write = self.disk_manager.read_sectors(
+                                self.source_disk['path'],
+                                source_gpt_sector_alt + 1,
+                                32
+                            )
+                            logger.info(f"✓ Read {len(gpt_entries_to_write)} bytes of GPT partition entries")
                         else:
                             logger.info("✗ No EFI signature in source at 0x4001 either")
                             # No GPT found - try to detect actual BOOT0 location by searching for MBR
@@ -1495,6 +1516,17 @@ rescan
                 gpt_header_to_write,
                 skip_prepare=True
             )
+            
+            # STEP 5: Write GPT partition entries if we have them
+            if gpt_entries_to_write:
+                logger.info(f"Step 5: Writing GPT partition entries to target (32 sectors)...")
+                self.disk_manager.write_sectors(
+                    self.target_disk['path'],
+                    target_gpt_sector + 1,
+                    gpt_entries_to_write,
+                    skip_prepare=True
+                )
+                logger.info("✓ Successfully wrote GPT partition entries")
 
             logger.info("✓ Successfully wrote EFI signature - Fix Raw should now work!")
             logger.info("=" * 60)
