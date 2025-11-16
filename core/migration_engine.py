@@ -1381,7 +1381,11 @@ rescan
         2. If found, copy to target
         3. If not found, try to find it in already-copied target data
         4. If still not found, create minimal valid GPT header
+        
+        Returns: The detected offset (0xC001 or 0x4001) for use in emummc.ini calculation
         """
+        detected_offset = 0xC001  # Default offset
+        
         try:
             self._report_progress("Updating emuMMC Config", 95.5, "Writing EFI signature for Fix Raw detection...")
             logger.info("=" * 60)
@@ -1414,6 +1418,7 @@ rescan
                     if source_gpt_data[:8] == b'EFI PART':
                         logger.info("✓ Found valid EFI signature in SOURCE at offset 0xC001")
                         gpt_header_to_write = source_gpt_data
+                        detected_offset = 0xC001
                     else:
                         logger.info("✗ No EFI signature in source at 0xC001, trying 0x4001...")
 
@@ -1428,16 +1433,21 @@ rescan
                         if source_gpt_data_alt[:8] == b'EFI PART':
                             logger.info("✓ Found valid EFI signature in SOURCE at offset 0x4001")
                             gpt_header_to_write = source_gpt_data_alt
+                            detected_offset = 0x4001
                         else:
                             logger.info("✗ No EFI signature in source at 0x4001 either")
 
                 except Exception as e:
                     logger.warning(f"Could not read from source emuMMC: {e}")
+            
+            # Store the detected offset for later use in emummc.ini calculation
+            self.detected_emummc_offset = detected_offset
+            logger.info(f"Detected emuMMC offset: 0x{detected_offset:X} ({detected_offset} sectors)")
 
             # STEP 2: If not found in source, check if it was already copied to target
             if not gpt_header_to_write:
                 logger.info("Step 2: Checking if GPT already exists in copied TARGET data...")
-                target_gpt_sector = target_partition_start + 0xC001
+                target_gpt_sector = target_partition_start + detected_offset
 
                 target_gpt_data = self.disk_manager.read_sectors(
                     self.target_disk['path'],
@@ -1446,13 +1456,14 @@ rescan
                 )
 
                 if target_gpt_data[:8] == b'EFI PART':
-                    logger.info("✓ GPT already present in target at offset 0xC001 - Fix Raw should work!")
-                    return  # Nothing to do, GPT already exists
+                    logger.info(f"✓ GPT already present in target at offset 0x{detected_offset:X} - Fix Raw should work!")
+                    return detected_offset  # Nothing to do, GPT already exists
                 else:
-                    logger.info("✗ No GPT in target at 0xC001")
+                    logger.info(f"✗ No GPT in target at 0x{detected_offset:X}")
 
-                    # Try 0x4001
-                    target_gpt_sector_alt = target_partition_start + 0x4001
+                    # Try alternate offset
+                    alternate_offset = 0x4001 if detected_offset == 0xC001 else 0xC001
+                    target_gpt_sector_alt = target_partition_start + alternate_offset
                     target_gpt_data_alt = self.disk_manager.read_sectors(
                         self.target_disk['path'],
                         target_gpt_sector_alt,
@@ -1460,16 +1471,18 @@ rescan
                     )
 
                     if target_gpt_data_alt[:8] == b'EFI PART':
-                        logger.info("✓ GPT found in target at offset 0x4001 - Fix Raw should work!")
-                        return  # GPT exists at alternate location
+                        logger.info(f"✓ GPT found in target at offset 0x{alternate_offset:X} - Fix Raw should work!")
+                        detected_offset = alternate_offset
+                        self.detected_emummc_offset = detected_offset
+                        return detected_offset  # GPT exists at alternate location
 
             # STEP 3: If still not found, create minimal valid GPT header
             if not gpt_header_to_write:
                 logger.info("Step 3: Creating minimal valid GPT header for hekate detection...")
                 gpt_header_to_write = self._create_minimal_gpt_header()
 
-            # STEP 4: Write GPT header to target at offset 0xC001
-            target_gpt_sector = target_partition_start + 0xC001
+            # STEP 4: Write GPT header to target at detected offset
+            target_gpt_sector = target_partition_start + detected_offset
             logger.info(f"Step 4: Writing GPT header to target sector {target_gpt_sector} (0x{target_gpt_sector:X})")
 
             self.disk_manager.write_sectors(
@@ -1481,12 +1494,15 @@ rescan
 
             logger.info("✓ Successfully wrote EFI signature - Fix Raw should now work!")
             logger.info("=" * 60)
+            
+            return detected_offset
 
         except Exception as e:
             logger.error(f"Error writing emuMMC EFI signature: {e}")
             import traceback
             logger.error(traceback.format_exc())
             # Don't fail the migration, just log the error
+            return 0xC001  # Return default offset
 
     def _create_minimal_gpt_header(self) -> bytes:
         """
@@ -1584,7 +1600,8 @@ rescan
             return
 
         # First, write the EFI signature at the correct offset for hekate's Fix Raw detection
-        self._write_emummc_efi_signature(target_emummc[0])
+        # This also detects the actual offset used in the source emuMMC
+        detected_offset = self._write_emummc_efi_signature(target_emummc[0])
 
         # Need to create/update hekate emuMMC configuration
         self._report_progress("Updating emuMMC Config", 96, "Creating hekate emuMMC configuration...")
@@ -1632,45 +1649,33 @@ rescan
             target_emummc_gpt_start = target_emummc[0].start_sector
 
             # Calculate MBR partition offset and emummc.ini sector
-            # Hekate's emuMMC structure within the partition:
-            #   0x0000 - 0x1FFF: BOOT0 (4 MB)
-            #   0x2000 - 0x3FFF: BOOT1 (4 MB)
-            #   0x4000 - 0xBFFF: Protective gap (16 MB)
-            #   0xC000 onwards:  USER eMMC (main data, ~29 GB)
             #
-            # Hekate's emuMMC sector calculation:
-            #   Based on hekate source code analysis and testing:
-            #   1. Start with 0x8000 (16MB protective offset)
-            #   2. Add MBR partition start sector
-            #   3. Round UP to 32MB (0x10000) alignment
+            # The sector in emummc.ini must match the actual offset where the emuMMC data is located.
+            # We detected this offset by finding the GPT header in the source emuMMC.
             #
-            # From hekate source (gui_emummc_tools.c line 164):
-            #   mbr_ctx.sector_start = 0x8000; // Protective offset
-            #   then adds partition starts
+            # Common offsets:
+            #   - 0xC001 (49153 sectors / ~24.09 MB) - Full-size emuMMC with protective offset
+            #   - 0x4001 (16385 sectors / ~8.01 MB) - Resized emuMMC without full protective offset
             #
-            # From testing:
-            #   1TB card: partition@0x76B05800, hekate assigned sector=0x76B10000
-            #   Calculation: 0x8000 + 0x76B05800 = 0x76B0D800
-            #   Rounded to 0x10000: 0x76B10000 (matches!)
+            # The calculation is:
+            #   1. Start with the MBR partition start sector
+            #   2. Add the detected offset from source (0xC001 or 0x4001)
+            #   3. This gives the actual sector where the emuMMC data begins
+            #
+            # NOTE: We do NOT add an additional 0x8000 base offset or round to 0x10000 alignment,
+            # because the data was copied bit-by-bit from source to target, preserving the 
+            # internal structure. The sector in emummc.ini must point to where the data actually is.
 
-            BASE_OFFSET = 0x8000  # 16MB protective offset
-            ALIGNMENT = 0x10000   # 32MB alignment (hekate Fix RAW uses this)
-
-            # Get MBR partition start (convert from GPT if needed)
-            # For MBR-only disks, GPT start == MBR start
+            # Get MBR partition start
             mbr_partition_start = target_emummc_gpt_start
 
-            # Calculate sector before alignment
-            unaligned_sector = BASE_OFFSET + mbr_partition_start
-
-            # Round UP to 32MB (0x10000) alignment - this is what hekate "Fix RAW" does
-            emummc_ini_sector = ((unaligned_sector + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT
+            # Use the detected offset (0xC001 or 0x4001) from the source emuMMC
+            emummc_ini_sector = mbr_partition_start + detected_offset
 
             logger.info(f"emuMMC sector calculation:")
             logger.info(f"  MBR partition start: 0x{mbr_partition_start:X} ({mbr_partition_start:,})")
-            logger.info(f"  Base offset (0x8000): + {BASE_OFFSET:,} sectors")
-            logger.info(f"  Unaligned sector: 0x{unaligned_sector:X} ({unaligned_sector:,})")
-            logger.info(f"  Aligned to 0x{ALIGNMENT:X} (32MB): 0x{emummc_ini_sector:X} ({emummc_ini_sector:,})")
+            logger.info(f"  Detected offset (from source): 0x{detected_offset:X} ({detected_offset:,} sectors)")
+            logger.info(f"  Final sector for emummc.ini: 0x{emummc_ini_sector:X} ({emummc_ini_sector:,})")
 
             # Determine which RAW folder to use (RAW1, RAW2, or RAW3)
             # Based on which MBR partition the emuMMC is in
