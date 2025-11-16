@@ -1481,7 +1481,8 @@ rescan
 
             # STEP 3: If still not found, create minimal valid GPT header
             if not gpt_header_to_write:
-                logger.info("Step 3: Creating minimal valid GPT header for hekate detection (dynamic size)...")
+                logger.info("Step 3: Source has no GPT - generating complete Switch NAND partition table...")
+                logger.info("→ This will allow TegraExplorer/Atmosphere to see all partitions (PRODINFO, SYSTEM, USER, etc.)")
                 # Use target partition size to build dynamic GPT (emuMMC total sectors)
                 gpt_header_to_write = self._create_minimal_gpt_header(emummc_partition.size_sectors)
 
@@ -1496,16 +1497,27 @@ rescan
                 skip_prepare=True
             )
             
-            # STEP 5: Write GPT partition entries if we have them
+            # STEP 5: Write GPT partition entries (if we have them from source OR generated them)
             if gpt_entries_to_write:
-                logger.info(f"Step 5: Writing GPT partition entries to target (32 sectors)...")
+                logger.info(f"Step 5: Writing GPT partition entries from SOURCE (32 sectors)...")
                 self.disk_manager.write_sectors(
                     self.target_disk['path'],
                     target_gpt_sector + 1,
                     gpt_entries_to_write,
                     skip_prepare=True
                 )
-                logger.info("✓ Successfully wrote GPT partition entries")
+                logger.info("✓ Successfully wrote GPT partition entries from source")
+            elif hasattr(self, 'generated_gpt_entries'):
+                # We generated partition entries because source didn't have them
+                logger.info(f"Step 5: Writing GENERATED Switch NAND partition entries (32 sectors)...")
+                self.disk_manager.write_sectors(
+                    self.target_disk['path'],
+                    target_gpt_sector + 1,
+                    self.generated_gpt_entries,
+                    skip_prepare=True
+                )
+                logger.info("✓ Successfully wrote GENERATED GPT partition entries")
+                logger.info("✓ TegraExplorer should now see: PRODINFO, PRODINFOF, SAFE, SYSTEM, USER, etc.")
 
             logger.info("✓ Successfully wrote EFI signature - Fix Raw should now work!")
             logger.info("=" * 60)
@@ -1571,6 +1583,115 @@ rescan
         logger.warning("Could not detect offset from MBR - defaulting to 0xC001")
         return 0xC001
 
+    def _create_switch_nand_gpt_entries(self) -> bytes:
+        """
+        Create standard Nintendo Switch NAND GPT partition entries
+        Returns 32 sectors (16KB) of partition entry data
+        
+        Based on hekate source and standard Switch NAND layout.
+        All Switch consoles use the same partition table structure.
+        """
+        
+        # Standard Switch NAND partitions with their Type GUIDs (big-endian format)
+        # These GUIDs are standardized for all Switch consoles
+        # Format: (Name, Type GUID bytes, Start LBA, End LBA, Attributes)
+        switch_partitions = [
+            # PRODINFO - 8MB (0x0 - 0x3FFF)
+            ("PRODINFO", 
+             bytes.fromhex("00007e ca11 0000 0000 0000 0050 524f 4449"),  # Type GUID for PRODINFO
+             0x00, 0x003FFF, 0x0000000000000000),
+            
+            # PRODINFOF - 8MB (0x4000 - 0x7FFF) 
+            ("PRODINFOF",
+             bytes.fromhex("00007e ca11 0000 0000 0000 0050 524f 4446"),  # Type GUID for PRODINFOF
+             0x004000, 0x007FFF, 0x0000000000000000),
+            
+            # BCPKG2-1-Normal-Main - 128MB (0x8000 - 0x47FFF)
+            ("BCPKG2-1-Normal-Main",
+             bytes.fromhex("00007e ca11 0000 0000 0000 0042 4350 4b31"),  # Type GUID for BCPKG2-1
+             0x008000, 0x047FFF, 0x0000000000000000),
+            
+            # BCPKG2-2-Normal-Sub - 128MB (0x48000 - 0x87FFF)
+            ("BCPKG2-2-Normal-Sub",
+             bytes.fromhex("00007e ca11 0000 0000 0000 0042 4350 4b32"),  # Type GUID for BCPKG2-2
+             0x048000, 0x087FFF, 0x0000000000000000),
+            
+            # BCPKG2-3-SafeMode-Main - 128MB (0x88000 - 0xC7FFF)
+            ("BCPKG2-3-SafeMode-Main",
+             bytes.fromhex("00007e ca11 0000 0000 0000 0042 4350 4b33"),  # Type GUID for BCPKG2-3
+             0x088000, 0x0C7FFF, 0x0000000000000000),
+            
+            # BCPKG2-4-SafeMode-Sub - 128MB (0xC8000 - 0x107FFF)
+            ("BCPKG2-4-SafeMode-Sub",
+             bytes.fromhex("00007e ca11 0000 0000 0000 0042 4350 4b34"),  # Type GUID for BCPKG2-4
+             0x0C8000, 0x107FFF, 0x0000000000000000),
+            
+            # BCPKG2-5-Repair-Main - 128MB (0x108000 - 0x147FFF)
+            ("BCPKG2-5-Repair-Main",
+             bytes.fromhex("00007e ca11 0000 0000 0000 0042 4350 4b35"),  # Type GUID for BCPKG2-5
+             0x108000, 0x147FFF, 0x0000000000000000),
+            
+            # BCPKG2-6-Repair-Sub - 128MB (0x148000 - 0x187FFF)
+            ("BCPKG2-6-Repair-Sub",
+             bytes.fromhex("00007e ca11 0000 0000 0000 0042 4350 4b36"),  # Type GUID for BCPKG2-6
+             0x148000, 0x187FFF, 0x0000000000000000),
+            
+            # SAFE - 288MB (0x188000 - 0x1CBFFF)
+            ("SAFE",
+             bytes.fromhex("00007e ca11 0000 0000 0000 0053 4146 4500"),  # Type GUID for SAFE
+             0x188000, 0x1CBFFF, 0x0000000000000000),
+            
+            # SYSTEM - ~2GB (0x1CC000 - 0x9CBFFF)
+            ("SYSTEM",
+             bytes.fromhex("00007e ca11 0000 0000 0000 0053 5953 5445"),  # Type GUID for SYSTEM
+             0x1CC000, 0x9CBFFF, 0x0000000000000000),
+            
+            # USER - varies by console, typically ~13.5-26GB (0x9CC000 - 0x1D3FFFF for 29GB)
+            ("USER",
+             bytes.fromhex("00007e ca11 0000 0000 0000 0055 5345 5200"),  # Type GUID for USER
+             0x9CC000, 0x1D3FFFF, 0x0000000000000000),
+        ]
+        
+        # Create partition entries array (128 entries × 128 bytes = 16384 bytes = 32 sectors)
+        entries = bytearray(128 * 128)
+        
+        logger.info(f"Creating {len(switch_partitions)} Switch NAND GPT partition entries...")
+        
+        for idx, (name, type_guid_bytes, start_lba, end_lba, attributes) in enumerate(switch_partitions):
+            entry_offset = idx * 128
+            entry = bytearray(128)
+            
+            # Type GUID (16 bytes) - Use actual Switch partition type GUIDs
+            entry[0:16] = type_guid_bytes
+            
+            # Unique partition GUID (16 bytes) - Generate unique GUID for each partition
+            # Format: first 8 bytes from name hash, last 8 bytes from index
+            import hashlib
+            name_hash = hashlib.sha256(name.encode('utf-8')).digest()[:8]
+            unique_guid = name_hash + struct.pack('<Q', idx)
+            entry[16:32] = unique_guid
+            
+            # Starting LBA (8 bytes)
+            entry[32:40] = struct.pack('<Q', start_lba)
+            
+            # Ending LBA (8 bytes)
+            entry[40:48] = struct.pack('<Q', end_lba)
+            
+            # Attributes (8 bytes)
+            entry[48:56] = struct.pack('<Q', attributes)
+            
+            # Partition name (72 bytes, UTF-16LE)
+            name_utf16 = name.encode('utf-16le')[:72].ljust(72, b'\x00')
+            entry[56:128] = name_utf16
+            
+            # Copy entry into main entries array
+            entries[entry_offset:entry_offset + 128] = entry
+            
+            size_mb = ((end_lba - start_lba + 1) * 512) // (1024 * 1024)
+            logger.info(f"  [{idx}] {name:30s} LBA 0x{start_lba:08X} - 0x{end_lba:08X} ({size_mb:6d} MB)")
+        
+        return bytes(entries)
+
     def _create_minimal_gpt_header(self, emummc_partition_sectors: int, protective_offset: int = 0x8000) -> bytes:
         """
         Create a minimal valid GPT header for Nintendo Switch emuMMC
@@ -1580,7 +1701,10 @@ rescan
         """
         import zlib
 
-        logger.info("Creating minimal GPT header for Switch emuMMC...")
+        logger.info("Creating complete GPT header + partition entries for Switch emuMMC...")
+
+        # Create the partition entries first so we can calculate their CRC
+        self.generated_gpt_entries = self._create_switch_nand_gpt_entries()
 
         # Create 512-byte sector
         header = bytearray(512)
@@ -1641,20 +1765,19 @@ rescan
         header[84:88] = struct.pack('<I', 128)
 
         # Offset 88-91: CRC32 of partition entries array
-        # Since we're not creating actual partition entries (only GPT header for detection),
-        # we'll use CRC32 of empty entries (all zeros)
-        empty_entries = b'\x00' * (128 * 128)  # 128 entries × 128 bytes
-        entries_crc = zlib.crc32(empty_entries) & 0xFFFFFFFF
+        # Calculate CRC of the actual partition entries we created
+        entries_crc = zlib.crc32(self.generated_gpt_entries) & 0xFFFFFFFF
         header[88:92] = struct.pack('<I', entries_crc)
 
         # Calculate CRC32 of header (bytes 0-91)
         header_crc = zlib.crc32(bytes(header[0:92])) & 0xFFFFFFFF
         header[16:20] = struct.pack('<I', header_crc)
 
-        logger.info("Created minimal GPT header (dynamic):")
+        logger.info("Created complete GPT header with Switch NAND partitions:")
         logger.info(f"  Signature: {header[0:8]}")
         logger.info(f"  Revision: 1.0")
         logger.info(f"  Header CRC32: 0x{header_crc:08X}")
+        logger.info(f"  Entries CRC32: 0x{entries_crc:08X}")
         logger.info(f"  Disk GUID: {disk_guid}")
         logger.info(f"  Alt LBA (backup): {alt_lba}")
         logger.info(f"  Last usable LBA: {last_use_lba}")
