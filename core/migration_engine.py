@@ -186,13 +186,15 @@ class MigrationEngine:
                 continue
 
             partition_progress = (idx / total_partitions) * 70
+            partition_range = 70 / total_partitions  # How much progress this partition can use
             stage_name = f"Copying {source_part.name}"
 
             self._copy_partition_data(
                 source_part,
                 target_part,
                 stage_name,
-                base_progress + partition_progress
+                base_progress + partition_progress,
+                partition_range
             )
 
     def _should_migrate_partition(self, partition) -> bool:
@@ -207,13 +209,17 @@ class MigrationEngine:
             return self.options['migrate_emummc']
         return False
 
-    def _copy_partition_data(self, source_part, target_part, stage_name, base_progress):
-        """Copy data from source partition to target partition - uses appropriate method based on type"""
+    def _copy_partition_data(self, source_part, target_part, stage_name, base_progress, progress_range=70):
+        """Copy data from source partition to target partition - uses appropriate method based on type
+
+        Args:
+            progress_range: How much of the total progress bar this partition can use (default 70 for single partition)
+        """
 
         # FAT32: Use file-level copy (much faster, only copies actual files)
         if source_part.category == 'FAT32':
             logger.info(f"Using file-level copy for FAT32 partition")
-            self._copy_fat32_files(source_part, target_part, stage_name, base_progress)
+            self._copy_fat32_files(source_part, target_part, stage_name, base_progress, progress_range)
         else:
             # RAW partitions (emuMMC, Linux, Android): Use bit-by-bit sector copy
             logger.info(f"Using sector-level copy for {source_part.category} partition")
@@ -465,8 +471,12 @@ class MigrationEngine:
         elapsed = time.time() - start_time[0]
         logger.info(f"Threaded sector copy completed in {elapsed:.1f} seconds")
 
-    def _copy_fat32_files(self, source_part, target_part, stage_name, base_progress):
-        """Copy FAT32 partition using file-level copy (much faster than sector copy)"""
+    def _copy_fat32_files(self, source_part, target_part, stage_name, base_progress, progress_range=70):
+        """Copy FAT32 partition using file-level copy (much faster than sector copy)
+
+        Args:
+            progress_range: Total progress range allocated for this partition copy
+        """
 
         logger.info("=== FAT32 File-Level Copy ===")
         self._report_progress(stage_name, base_progress, "Preparing FAT32 copy...")
@@ -516,7 +526,8 @@ class MigrationEngine:
                 source_drive_letter,
                 target_drive_letter,
                 stage_name,
-                base_progress + 10
+                base_progress + 10,
+                progress_range - 10  # Reserve 10% for preparation, rest for file copy
             )
 
             logger.info("FAT32 file copy completed successfully")
@@ -1087,8 +1098,12 @@ rescan
         except Exception as e:
             logger.warning(f"Could not refresh disk partitions: {e}")
 
-    def _copy_files_simple(self, source_drive, target_drive, stage_name, base_progress):
-        """Copy files using simple Python shutil - more reliable than robocopy"""
+    def _copy_files_simple(self, source_drive, target_drive, stage_name, base_progress, progress_range=60):
+        """Copy files using simple Python shutil - more reliable than robocopy
+
+        Args:
+            progress_range: Total progress range allocated for file copy (default 60)
+        """
         import os
         from pathlib import Path
 
@@ -1111,35 +1126,35 @@ rescan
         logger.info(f"Scanning source directory for files...")
         total_files = sum(1 for root, dirs, files in os.walk(source) for file in files)
         logger.info(f"Found {total_files} files to copy")
-        
+
         start_time = time.time()
         files_copied = 0
         bytes_copied = 0
-        
+
         try:
             # Walk through source directory
             for root, dirs, files in os.walk(source):
                 # Calculate relative path
                 rel_path = Path(root).relative_to(source)
                 target_dir = target / rel_path
-                
+
                 # Create target directory if it doesn't exist
                 target_dir.mkdir(parents=True, exist_ok=True)
-                
+
                 # Copy each file
                 for file in files:
                     if self.cancelled:
                         raise Exception("Migration cancelled by user")
-                    
+
                     source_file = Path(root) / file
                     target_file = target_dir / file
-                    
+
                     try:
                         # Copy file
                         shutil.copy2(source_file, target_file)
                         files_copied += 1
                         bytes_copied += source_file.stat().st_size
-                        
+
                         # Update progress every 10 files or every 100MB
                         if files_copied % 10 == 0 or (bytes_copied // (100 * 1024 * 1024)) > ((bytes_copied - source_file.stat().st_size) // (100 * 1024 * 1024)):
                             elapsed = time.time() - start_time
@@ -1147,14 +1162,18 @@ rescan
                             percent_complete = (files_copied / total_files * 100) if total_files > 0 else 0
                             logger.info(f"Copied {files_copied}/{total_files} files ({percent_complete:.1f}%), {bytes_copied / (1024**3):.2f} GB at {speed_mbps:.1f} MB/s")
 
-                            # Calculate progress within the FAT32 copy stage (10% to 85% of the stage)
-                            file_progress = (files_copied / total_files * 75) if total_files > 0 else 0
-                            self._report_progress(stage_name, base_progress + 10 + file_progress,
+                            # Calculate progress within allocated range
+                            # Use 90% of the range for actual copying, reserve 10% for completion
+                            file_progress = (files_copied / total_files * progress_range * 0.9) if total_files > 0 else 0
+                            current_progress = base_progress + file_progress
+                            # Cap at 100% to prevent overflow
+                            current_progress = min(100, current_progress)
+                            self._report_progress(stage_name, current_progress,
                                                 f"Copied {files_copied}/{total_files} files ({percent_complete:.0f}%)")
                     except Exception as e:
                         logger.error(f"Failed to copy {source_file}: {e}")
                         raise
-            
+
             elapsed_time = time.time() - start_time
             mb_copied = bytes_copied / (1024 * 1024)
             speed_mbps = mb_copied / elapsed_time if elapsed_time > 0 else 0
@@ -1167,9 +1186,11 @@ rescan
                 logger.warning(f"No files were found in source directory: {source}")
                 logger.warning(f"The source FAT32 partition appears to be empty!")
 
-            self._report_progress(stage_name, base_progress + 85,
+            # Final progress - cap at 100%
+            final_progress = min(100, base_progress + progress_range)
+            self._report_progress(stage_name, final_progress,
                                 f"✓ Copied {files_copied} files ({mb_copied:.0f} MB) in {elapsed_time:.0f}s")
-            
+
         except Exception as e:
             logger.error(f"File copy error: {e}")
             raise
