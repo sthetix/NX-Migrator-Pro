@@ -229,11 +229,13 @@ class MigrationEngine:
             # Use the smaller of source or target partition size to avoid writing beyond partition boundary
             total_sectors = min(source_part.size_sectors, target_part.size_sectors)
 
-            # For emuMMC partitions, subtract 34 sectors (backup GPT space) as safety margin
-            # This prevents Windows "sector not found" errors when writing to the absolute end of partition
+            # For emuMMC partitions, subtract safety margin to avoid Windows boundary errors
+            # Windows often reserves the last portion of partitions for metadata/alignment
+            # Using 2048 sectors (1MB) as safety margin - matches Hekate's 1MB reserve (line 368: - 0x800)
             if source_part.category == 'emuMMC':
-                total_sectors = max(0, total_sectors - 34)
-                logger.info(f"emuMMC partition: Reserving 34 sectors at end for backup GPT")
+                safety_margin = 2048  # 1MB (0x800 sectors)
+                total_sectors = max(0, total_sectors - safety_margin)
+                logger.info(f"emuMMC partition: Reserving {safety_margin} sectors (1MB) at end for safety margin")
 
             if source_part.size_sectors > target_part.size_sectors:
                 logger.warning(f"Source partition ({source_part.size_sectors} sectors) is larger than target "
