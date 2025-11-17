@@ -220,7 +220,21 @@ class MigrationEngine:
 
             # Calculate chunk size in sectors
             chunk_sectors = CHUNK_SIZE // SECTOR_SIZE
-            total_sectors = source_part.size_sectors
+            # Use the smaller of source or target partition size to avoid writing beyond partition boundary
+            total_sectors = min(source_part.size_sectors, target_part.size_sectors)
+
+            # For emuMMC partitions, subtract 34 sectors (backup GPT space) as safety margin
+            # This prevents Windows "sector not found" errors when writing to the absolute end of partition
+            if source_part.category == 'emuMMC':
+                total_sectors = max(0, total_sectors - 34)
+                logger.info(f"emuMMC partition: Reserving 34 sectors at end for backup GPT")
+
+            if source_part.size_sectors > target_part.size_sectors:
+                logger.warning(f"Source partition ({source_part.size_sectors} sectors) is larger than target "
+                             f"({target_part.size_sectors} sectors). Will copy only {total_sectors} sectors.")
+
+            logger.info(f"Copying {total_sectors} sectors from {source_part.name} "
+                       f"({(total_sectors * SECTOR_SIZE) / (1024**3):.2f} GB)")
 
             # Use threaded I/O only if we have multiple buffers
             if NUM_BUFFERS > 1:
@@ -1583,73 +1597,77 @@ rescan
         logger.warning("Could not detect offset from MBR - defaulting to 0xC001")
         return 0xC001
 
-    def _create_switch_nand_gpt_entries(self) -> bytes:
+    def _create_switch_nand_gpt_entries(self, max_lba: int = 0x1D3FFFF) -> bytes:
         """
         Create standard Nintendo Switch NAND GPT partition entries
         Returns 32 sectors (16KB) of partition entry data
-        
+
         Based on hekate source and standard Switch NAND layout.
         All Switch consoles use the same partition table structure.
+
+        Args:
+            max_lba: Maximum LBA available for the USER partition (for trimmed emuMMC)
         """
-        
+
         # Standard Switch NAND partitions with their Type GUIDs (big-endian format)
         # These GUIDs are standardized for all Switch consoles
         # Format: (Name, Type GUID bytes, Start LBA, End LBA, Attributes)
         switch_partitions = [
             # PRODINFO - 8MB (0x0 - 0x3FFF)
-            ("PRODINFO", 
+            ("PRODINFO",
              bytes.fromhex("00007eca1100000000000050524f4449"),  # Type GUID for PRODINFO
              0x00, 0x003FFF, 0x0000000000000000),
-            
-            # PRODINFOF - 8MB (0x4000 - 0x7FFF) 
+
+            # PRODINFOF - 8MB (0x4000 - 0x7FFF)
             ("PRODINFOF",
              bytes.fromhex("00007eca1100000000000050524f4446"),  # Type GUID for PRODINFOF
              0x004000, 0x007FFF, 0x0000000000000000),
-            
+
             # BCPKG2-1-Normal-Main - 128MB (0x8000 - 0x47FFF)
             ("BCPKG2-1-Normal-Main",
              bytes.fromhex("00007eca110000000000004243504b31"),  # Type GUID for BCPKG2-1
              0x008000, 0x047FFF, 0x0000000000000000),
-            
+
             # BCPKG2-2-Normal-Sub - 128MB (0x48000 - 0x87FFF)
             ("BCPKG2-2-Normal-Sub",
              bytes.fromhex("00007eca110000000000004243504b32"),  # Type GUID for BCPKG2-2
              0x048000, 0x087FFF, 0x0000000000000000),
-            
+
             # BCPKG2-3-SafeMode-Main - 128MB (0x88000 - 0xC7FFF)
             ("BCPKG2-3-SafeMode-Main",
              bytes.fromhex("00007eca110000000000004243504b33"),  # Type GUID for BCPKG2-3
              0x088000, 0x0C7FFF, 0x0000000000000000),
-            
+
             # BCPKG2-4-SafeMode-Sub - 128MB (0xC8000 - 0x107FFF)
             ("BCPKG2-4-SafeMode-Sub",
              bytes.fromhex("00007eca110000000000004243504b34"),  # Type GUID for BCPKG2-4
              0x0C8000, 0x107FFF, 0x0000000000000000),
-            
+
             # BCPKG2-5-Repair-Main - 128MB (0x108000 - 0x147FFF)
             ("BCPKG2-5-Repair-Main",
              bytes.fromhex("00007eca110000000000004243504b35"),  # Type GUID for BCPKG2-5
              0x108000, 0x147FFF, 0x0000000000000000),
-            
+
             # BCPKG2-6-Repair-Sub - 128MB (0x148000 - 0x187FFF)
             ("BCPKG2-6-Repair-Sub",
              bytes.fromhex("00007eca110000000000004243504b36"),  # Type GUID for BCPKG2-6
              0x148000, 0x187FFF, 0x0000000000000000),
-            
+
             # SAFE - 288MB (0x188000 - 0x1CBFFF)
             ("SAFE",
              bytes.fromhex("00007eca110000000000005341464500"),  # Type GUID for SAFE
              0x188000, 0x1CBFFF, 0x0000000000000000),
-            
+
             # SYSTEM - ~2GB (0x1CC000 - 0x9CBFFF)
             ("SYSTEM",
              bytes.fromhex("00007eca110000000000005359535445"),  # Type GUID for SYSTEM
              0x1CC000, 0x9CBFFF, 0x0000000000000000),
-            
-            # USER - varies by console, typically ~13.5-26GB (0x9CC000 - 0x1D3FFFF for 29GB)
+
+            # USER - varies by console, typically ~13.5-26GB
+            # For trimmed emuMMC, end will be adjusted to max_lba
             ("USER",
              bytes.fromhex("00007eca110000000000005553455200"),  # Type GUID for USER
-             0x9CC000, 0x1D3FFFF, 0x0000000000000000),
+             0x9CC000, min(0x1D3FFFF, max_lba), 0x0000000000000000),
         ]
         
         # Create partition entries array (128 entries × 128 bytes = 16384 bytes = 32 sectors)
@@ -1703,8 +1721,39 @@ rescan
 
         logger.info("Creating complete GPT header + partition entries for Switch emuMMC...")
 
+        # Calculate max LBA for USER partition based on actual emuMMC partition size
+        # The emuMMC internal structure (LBAs are relative to BOOT0 start, which is at protective_offset from partition start):
+        # - LBA 0x0000 - 0x1FFF:   BOOT0 (4MB)
+        # - LBA 0x2000 - 0x3FFF:   BOOT1 (4MB)
+        # - LBA 0x4000 - 0xBFFF:   Protective gap (16MB)
+        # - LBA 0xC000:            USER partition MBR
+        # - LBA 0xC001:            USER partition GPT header
+        # - LBA 0xC002 - 0xC021:   USER partition GPT entries (32 sectors)
+        # - LBA 0xC022 onwards:    First usable sector for partitions
+        #
+        # For USER partition entry in GPT:
+        # - Start: 0x9CC000 (fixed, this is where USER data begins in Switch NAND)
+        # - End: Must not exceed the available space in the emuMMC partition
+        #
+        # Available LBA = (emummc_partition_sectors - protective_offset) - 1 (convert size to last LBA)
+        #               - 34 (reserve for backup GPT header + entries at the end)
+
+        if emummc_partition_sectors:
+            # Calculate the last usable LBA relative to BOOT0 start
+            available_lba = (emummc_partition_sectors - protective_offset) - 1 - 34
+            # USER partition cannot exceed available space
+            # For trimmed emuMMC, this will be less than the standard 0x1D3FFFF (29GB)
+            # Use min() to ensure we don't exceed the actual partition size
+            max_user_lba = min(0x1D3FFFF, available_lba)
+        else:
+            # Default to full 29GB emuMMC size
+            max_user_lba = 0x1D3FFFF
+
+        logger.info(f"Trimmed emuMMC partition size: {emummc_partition_sectors:,} sectors")
+        logger.info(f"Calculated max USER LBA: 0x{max_user_lba:X} ({max_user_lba:,})")
+
         # Create the partition entries first so we can calculate their CRC
-        self.generated_gpt_entries = self._create_switch_nand_gpt_entries()
+        self.generated_gpt_entries = self._create_switch_nand_gpt_entries(max_lba=max_user_lba)
 
         # Create 512-byte sector
         header = bytearray(512)
