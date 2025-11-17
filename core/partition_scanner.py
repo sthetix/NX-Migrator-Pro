@@ -470,20 +470,26 @@ class PartitionScanner:
             emummc_parts = source_layout.get_emummc_partitions()
             logger.info(f"Adding {len(emummc_parts)} emuMMC partitions to target layout")
             for epart in emummc_parts:
+                # Reduce emuMMC partition size by safety margin (matches Hekate's 1MB reserve: 0x800 = 2048 sectors)
+                # This prevents Windows sector access errors at partition boundaries
+                safety_margin = 2048  # 1MB
+                adjusted_size_sectors = max(0, epart.size_sectors - safety_margin)
+                adjusted_size_mb = (adjusted_size_sectors * SECTOR_SIZE) // (1024 * 1024)
+
                 new_epart = Partition(
                     name=epart.name,
                     type_id=0xE0,
                     type_name='emuMMC',
                     start_sector=current_lba,
-                    size_sectors=epart.size_sectors,
-                    size_mb=epart.size_mb,
+                    size_sectors=adjusted_size_sectors,
+                    size_mb=adjusted_size_mb,
                     category='emuMMC',
                     in_mbr=True,
                     in_gpt=target_layout.has_gpt
                 )
                 target_layout.add_partition(new_epart)
-                logger.info(f"  Added emuMMC partition: {epart.name}, {epart.size_mb} MB")
-                current_lba += epart.size_sectors
+                logger.info(f"  Added emuMMC partition: {epart.name}, {adjusted_size_mb} MB (reduced by 1MB safety margin)")
+                current_lba += adjusted_size_sectors
         else:
             logger.info(f"NOT adding emuMMC partitions - has_emummc={source_layout.has_emummc}, migrate_emummc={options.get('migrate_emummc', False)}")
 

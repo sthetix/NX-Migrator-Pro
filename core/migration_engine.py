@@ -227,15 +227,8 @@ class MigrationEngine:
             # Calculate chunk size in sectors
             chunk_sectors = CHUNK_SIZE // SECTOR_SIZE
             # Use the smaller of source or target partition size to avoid writing beyond partition boundary
+            # Note: For emuMMC, the target partition size already has 1MB safety margin subtracted during layout creation
             total_sectors = min(source_part.size_sectors, target_part.size_sectors)
-
-            # For emuMMC partitions, subtract safety margin to avoid Windows boundary errors
-            # Windows often reserves the last portion of partitions for metadata/alignment
-            # Using 2048 sectors (1MB) as safety margin - matches Hekate's 1MB reserve (line 368: - 0x800)
-            if source_part.category == 'emuMMC':
-                safety_margin = 2048  # 1MB (0x800 sectors)
-                total_sectors = max(0, total_sectors - safety_margin)
-                logger.info(f"emuMMC partition: Reserving {safety_margin} sectors (1MB) at end for safety margin")
 
             if source_part.size_sectors > target_part.size_sectors:
                 logger.warning(f"Source partition ({source_part.size_sectors} sectors) is larger than target "
