@@ -393,7 +393,20 @@ class PartitionScanner:
             # Calculate available space
             total_disk_mb = (target_layout.total_sectors * SECTOR_SIZE) // (1024 * 1024)
             start_alignment_mb = ALIGN_SECTORS // 2048  # 16MB starting alignment
-            end_reserve_mb = 9  # Reserve ~9MB at end (matching Hekate's layout)
+
+            # Reserve space at end of disk to prevent partition boundary issues
+            # This accounts for:
+            # - Worst-case 16MB alignment gap between partitions
+            # - GPT backup structures (33 sectors for entries + 1 sector for header)
+            # - Windows sector access quirks near disk boundaries
+            # - Safety margin to prevent "sector not found" errors
+            if target_layout.has_gpt:
+                # GPT: Reserve for backup structures + alignment + safety
+                end_reserve_mb = 20
+            else:
+                # MBR: Reserve for alignment + safety (no GPT backup needed)
+                end_reserve_mb = 20
+
             reserved_mb = total_reserved_mb + start_alignment_mb + end_reserve_mb
             fat32_size_mb = total_disk_mb - reserved_mb
         else:
