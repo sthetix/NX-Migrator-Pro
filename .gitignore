@@ -46,6 +46,11 @@ popup_tester.py
 #ICONS
 icons/
 
+#text files
+*.txt
+
+
+
 
 
 
