@@ -1119,16 +1119,41 @@ rescan
 
         # Count total files first for better progress reporting
         logger.info(f"Scanning source directory for files...")
-        total_files = sum(1 for root, dirs, files in os.walk(source) for file in files)
-        logger.info(f"Found {total_files} files to copy")
+
+        # Define system folders/files to exclude (anything starting with dot)
+        def should_skip(name):
+            """Skip hidden files/folders (those starting with dot)"""
+            return name.startswith('.')
+
+        # Count files, excluding hidden/system files and folders
+        total_files = 0
+        for root, dirs, files in os.walk(source):
+            # Remove hidden directories from dirs list to prevent os.walk from entering them
+            dirs[:] = [d for d in dirs if not should_skip(d)]
+            # Count only non-hidden files
+            total_files += sum(1 for f in files if not should_skip(f))
+
+        logger.info(f"Found {total_files} files to copy (excluding hidden/system files)")
 
         start_time = time.time()
         files_copied = 0
         bytes_copied = 0
+        skipped_files = 0
+        failed_files = []
 
         try:
             # Walk through source directory
             for root, dirs, files in os.walk(source):
+                # Skip hidden directories (modify dirs in-place to prevent os.walk from entering them)
+                original_dirs = dirs[:]
+                dirs[:] = [d for d in dirs if not should_skip(d)]
+
+                # Log skipped directories
+                skipped_dirs = set(original_dirs) - set(dirs)
+                if skipped_dirs:
+                    for skipped_dir in skipped_dirs:
+                        logger.info(f"Skipping hidden/system directory: {Path(root) / skipped_dir}")
+
                 # Calculate relative path
                 rel_path = Path(root).relative_to(source)
                 target_dir = target / rel_path
@@ -1136,8 +1161,13 @@ rescan
                 # Create target directory if it doesn't exist
                 target_dir.mkdir(parents=True, exist_ok=True)
 
-                # Copy each file
+                # Copy each file (skip hidden files)
                 for file in files:
+                    # Skip hidden/system files
+                    if should_skip(file):
+                        skipped_files += 1
+                        logger.debug(f"Skipping hidden/system file: {Path(root) / file}")
+                        continue
                     if self.cancelled:
                         raise Exception("Migration cancelled by user")
 
@@ -1166,16 +1196,30 @@ rescan
                             self._report_progress(stage_name, current_progress,
                                                 f"Copied {files_copied}/{total_files} files ({percent_complete:.0f}%)")
                     except Exception as e:
+                        # Log error but continue with other files (non-fatal)
                         logger.error(f"Failed to copy {source_file}: {e}")
-                        raise
+                        failed_files.append(str(source_file))
+                        # Continue to next file instead of raising
 
             elapsed_time = time.time() - start_time
             mb_copied = bytes_copied / (1024 * 1024)
             speed_mbps = mb_copied / elapsed_time if elapsed_time > 0 else 0
 
-            logger.info(f"File copy completed successfully in {elapsed_time:.1f} seconds")
+            logger.info(f"File copy completed in {elapsed_time:.1f} seconds")
             logger.info(f"Files copied: {files_copied} of {total_files}")
             logger.info(f"Data copied: {mb_copied:.1f} MB ({bytes_copied / (1024**3):.2f} GB) at {speed_mbps:.1f} MB/s")
+
+            # Report skipped hidden/system files
+            if skipped_files > 0:
+                logger.info(f"Skipped {skipped_files} hidden/system files (files starting with '.')")
+
+            # Report failed files
+            if failed_files:
+                logger.warning(f"Failed to copy {len(failed_files)} file(s):")
+                for failed_file in failed_files[:10]:  # Show first 10 failed files
+                    logger.warning(f"  - {failed_file}")
+                if len(failed_files) > 10:
+                    logger.warning(f"  ... and {len(failed_files) - 10} more")
 
             if files_copied == 0:
                 logger.warning(f"No files were found in source directory: {source}")
@@ -1183,8 +1227,10 @@ rescan
 
             # Final progress - cap at 100%
             final_progress = min(100, base_progress + progress_range)
-            self._report_progress(stage_name, final_progress,
-                                f"✓ Copied {files_copied} files ({mb_copied:.0f} MB) in {elapsed_time:.0f}s")
+            status_msg = f"✓ Copied {files_copied} files ({mb_copied:.0f} MB) in {elapsed_time:.0f}s"
+            if failed_files:
+                status_msg += f" ({len(failed_files)} failed)"
+            self._report_progress(stage_name, final_progress, status_msg)
 
         except Exception as e:
             logger.error(f"File copy error: {e}")
