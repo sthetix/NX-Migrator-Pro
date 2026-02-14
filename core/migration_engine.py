@@ -1234,6 +1234,9 @@ rescan
 
             # Check if copy was successful
             if "SUCCESS" in stdout or "COMPLETED_WITH_ERRORS" in stdout:
+                # Initialize final_gb to avoid UnboundLocalError if exception occurs
+                final_gb = 0.0
+
                 # Get final copied size
                 try:
                     size_check_cmd = f'''
