@@ -23,6 +23,25 @@ from core.partition_scanner import PartitionScanner
 from core.migration_engine import MigrationEngine
 from core.cleanup_engine import CleanupEngine
 
+def get_sd_tier(size_gb: float) -> int:
+    """
+    Determine the SD card capacity tier based on size in GB.
+    Returns the standard tier (32, 64, 128, 256, 512, 1024, 1536).
+    This allows same-tier cards to use Clone Mode.
+    """
+    # Standard SD card tiers in GB
+    tiers = [32, 64, 128, 256, 512, 1024, 1536, 2048]
+
+    for tier in tiers:
+        # Allow some tolerance (cards are usually slightly smaller than advertised)
+        # e.g., a "128GB" card might report as 119GB
+        if size_gb < tier * 0.98:  # Within 2% below the tier
+            return tier
+
+    # For very large cards, return the size rounded to nearest tier
+    return tiers[-1]
+
+
 class MainWindow:
     """Main application window"""
 
@@ -364,19 +383,38 @@ class MainWindow:
         self.target_partition_frame.clear()
         self.migrate_button.config(state=DISABLED)
 
-        # Validate target is larger than source
-        if self.source_disk and disk_info['size_bytes'] <= self.source_disk['size_bytes']:
-            self.show_custom_info(
-                "Invalid Target",
-                f"Target disk ({disk_info['letter']}, {disk_info['size_gb']:.1f} GB) must be larger than source disk ({self.source_disk['letter']}, {self.source_disk['size_gb']:.1f} GB)",
-                width=500,
-                height=200
-            )
-            self.disk_selector.clear_target()
-            self.target_disk = None
-            return
+        if self.source_disk:
+            source_tier = get_sd_tier(self.source_disk['size_gb'])
+            target_tier = get_sd_tier(disk_info['size_gb'])
 
-        self._update_status(f"Target selected: {disk_info['letter']} - {disk_info['name']} ({disk_info['size_gb']:.1f} GB)")
+            # Target must be same tier or larger
+            if target_tier < source_tier:
+                self.show_custom_info(
+                    "Invalid Target",
+                    f"Target disk ({disk_info['letter']}, {disk_info['size_gb']:.1f} GB) is smaller than source disk ({self.source_disk['letter']}, {self.source_disk['size_gb']:.1f} GB).\n\n"
+                    f"Target must be same capacity tier ({source_tier} GB) or larger.",
+                    width=500,
+                    height=220
+                )
+                self.disk_selector.clear_target()
+                self.target_disk = None
+                return
+
+            # Check if same tier (Clone Mode)
+            if target_tier == source_tier:
+                # Same tier - use Clone Mode (no FAT32 expansion)
+                # But target must still have enough bytes for partitions
+                if disk_info['size_bytes'] < self.source_disk['size_bytes']:
+                    # Target is slightly smaller - warn but allow
+                    size_diff_mb = (self.source_disk['size_bytes'] - disk_info['size_bytes']) / (1024 * 1024)
+                    self._update_status(f"Target selected: {disk_info['letter']} ({disk_info['size_gb']:.1f} GB) - Clone Mode (target is {size_diff_mb:.0f} MB smaller)")
+                else:
+                    self._update_status(f"Target selected: {disk_info['letter']} ({disk_info['size_gb']:.1f} GB) - Clone Mode (same capacity tier)")
+            else:
+                # Larger tier - normal mode with FAT32 expansion
+                self._update_status(f"Target selected: {disk_info['letter']} - {disk_info['name']} ({disk_info['size_gb']:.1f} GB)")
+        else:
+            self._update_status(f"Target selected: {disk_info['letter']} - {disk_info['name']} ({disk_info['size_gb']:.1f} GB)")
 
     def _on_options_changed(self, options):
         """Called when migration/cleanup options change"""
@@ -516,11 +554,21 @@ class MainWindow:
             self._update_status("Calculating new partition layout...")
 
             if self.current_mode == "migration":
+                # Check if Clone Mode (same capacity tier)
+                source_tier = get_sd_tier(self.source_disk['size_gb'])
+                target_tier = get_sd_tier(self.target_disk['size_gb'])
+                is_clone_mode = (source_tier == target_tier)
+
+                # In Clone Mode, override expand_fat32 to False
+                options_for_calc = self.migration_options.copy()
+                if is_clone_mode:
+                    options_for_calc['expand_fat32'] = False
+
                 # Migration mode: calculate layout for target disk
                 new_layout = self.scanner.calculate_target_layout(
                     self.source_layout,
                     self.target_disk['size_bytes'],
-                    self.migration_options
+                    options_for_calc
                 )
 
                 self.target_layout = new_layout
@@ -653,10 +701,107 @@ class MainWindow:
 
             self.show_custom_info("Cleanup Summary", msg, width=550, height=380)
 
+    def _get_source_file_info(self):
+        """Get file count and total size from source FAT32 partition"""
+        import subprocess
+        try:
+            # Find source FAT32 drive letter
+            source_fat32_part = None
+            for part in self.source_layout.partitions:
+                if part.category == 'FAT32':
+                    source_fat32_part = part
+                    break
+
+            if not source_fat32_part:
+                return None, None
+
+            # Get drive letter for source partition
+            from core.migration_engine import MigrationEngine
+            temp_engine = MigrationEngine(None, None, None, None, None)
+            source_drive = temp_engine._get_drive_letter_for_partition(
+                self.source_disk['path'],
+                source_fat32_part.start_sector
+            )
+
+            if not source_drive:
+                return None, None
+
+            # Count files and get total size
+            count_cmd = f'''
+            $files = Get-ChildItem -Path "{source_drive}" -Recurse -File -Force -ErrorAction SilentlyContinue
+            $count = ($files | Measure-Object).Count
+            $size = ($files | Measure-Object -Property Length -Sum).Sum
+            if ($size -eq $null) {{ $size = 0 }}
+            Write-Output "$count|$size"
+            '''
+
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', count_cmd],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            )
+
+            if result.returncode == 0 and result.stdout.strip():
+                parts = result.stdout.strip().split('|')
+                if len(parts) == 2:
+                    file_count = int(parts[0]) if parts[0].isdigit() else 0
+                    total_bytes = int(parts[1]) if parts[1].isdigit() else 0
+                    return file_count, total_bytes
+
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Could not get source file info: {e}")
+
+        return None, None
+
+    def _show_migration_info_popup(self, file_count, total_bytes):
+        """Show migration info popup with file count and archive bit warning"""
+        total_gb = total_bytes / (1024**3) if total_bytes else 0
+
+        msg = f"📋 MIGRATION INFORMATION\n\n"
+        msg += f"Source: {self.source_disk['letter']} - {self.source_disk['name']} ({self.source_disk['size_gb']:.1f} GB)\n"
+        msg += f"Target: {self.target_disk['letter']} - {self.target_disk['name']} ({self.target_disk['size_gb']:.1f} GB)\n\n"
+
+        if file_count is not None:
+            msg += f"Files to copy: {file_count:,} files\n"
+        if total_gb > 0:
+            msg += f"Data to copy: {total_gb:.2f} GB\n\n"
+
+        msg += f"⚠️ ARCHIVE BIT WARNING:\n\n"
+        msg += f"The automatic Archive bit fix may fail with\n"
+        msg += f"large numbers of files. If this happens:\n\n"
+        msg += f"Your SD card will still work fine!\n\n"
+        msg += f"If needed, use Hekate to fix Archive Bit:\n"
+        msg += f"   1. Boot Hekate on your Switch\n"
+        msg += f"   2. Go to Tools (top) > Arch bit (bottom)\n"
+        msg += f"   3. Select 'Fix Archive Bit'\n"
+        msg += f"   4. Select your SD card and run\n\n"
+        msg += f"Ready to start migration?"
+
+        response = self.show_custom_confirm(
+            "Ready to Migrate",
+            msg,
+            yes_text="Start Migration",
+            no_text="Cancel",
+            style="info",
+            width=550,
+            height=800
+        )
+
+        return response
+
     def _start_migration(self):
         """Start the migration or cleanup process (depending on mode)"""
 
         if self.current_mode == "migration":
+            # Show migration info popup first
+            file_count, total_bytes = self._get_source_file_info()
+            info_response = self._show_migration_info_popup(file_count, total_bytes)
+
+            if not info_response:
+                return
+
             # Migration mode confirmations
             response = self.show_custom_confirm(
                 "Confirm Migration",
@@ -1193,9 +1338,9 @@ For more help:
         # Get version from main module
         try:
             import __main__
-            version = getattr(__main__, '__version__', '1.0.1')
+            version = getattr(__main__, '__version__', '1.0.5')
         except:
-            version = '1.0.1'
+            version = '1.0.5'
 
         about_text = f"""NX MIGRATOR PRO
 

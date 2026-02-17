@@ -510,4 +510,16 @@ class PartitionScanner:
         for p in target_layout.partitions:
             logger.info(f"  - {p.name} ({p.category}): {p.size_mb} MB")
 
+        # Safety check: ensure all partitions fit within target disk
+        if target_layout.partitions:
+            last_partition = target_layout.partitions[-1]
+            end_sector = last_partition.start_sector + last_partition.size_sectors
+            if end_sector > target_layout.total_sectors:
+                overflow_mb = ((end_sector - target_layout.total_sectors) * SECTOR_SIZE) / (1024 * 1024)
+                raise ValueError(
+                    f"Partitions exceed target disk capacity by {overflow_mb:.1f} MB.\n\n"
+                    f"This can happen when migrating to a same-size SD card that is slightly smaller.\n"
+                    f"Please use a larger capacity SD card."
+                )
+
         return target_layout
