@@ -9,7 +9,7 @@ License: GPL-2.0 (same as hekate)
 """
 
 # Version information
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
@@ -59,12 +59,36 @@ def main():
     """Entry point for the application"""
     logger.info("Starting NX Migrator Pro v{__version__}")
 
+    # Set Windows AppUserModelID for proper taskbar icon
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            # Set AppUserModelID to help Windows identify the application
+            # This ensures the taskbar shows the correct icon
+            app_id = "NXMigratorPro.NXMigratorPro.1.0"
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except Exception as e:
+            logger.warning(f"Could not set AppUserModelID: {e}")
+
     # Create root window
     root = ttk.Window(
         title=f"NX Migrator Pro v{__version__}",
         themename="darkly",
         resizable=(True, True)
     )
+
+    # Set application icon (taskbar and window title)
+    # Must be called AFTER window creation but may need Tkinter instance
+    icon_path = os.path.join(os.path.dirname(__file__), "icons", "icon.ico")
+    if os.path.exists(icon_path):
+        try:
+            root.iconbitmap(icon_path)
+            # Also set via wm_iconbitmap for compatibility
+            root.wm_iconbitmap(icon_path)
+        except Exception as e:
+            logger.warning(f"Could not load icon: {e}")
 
     # Get screen dimensions
     screen_width = root.winfo_screenwidth()

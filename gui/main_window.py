@@ -71,6 +71,10 @@ class MainWindow:
             'expand_fat32': True
         }
 
+        # Settings
+        self.temp_backup_dir = None  # None = use system default (temp folder)
+        self._load_settings()
+
         # Build UI
         self._create_menu()
         self._create_widgets()
@@ -86,6 +90,11 @@ class MainWindow:
         """Create menu bar"""
         menubar = ttk.Menu(self.root)
         self.root.config(menu=menubar)
+
+        # Settings Menu
+        settings_menu = ttk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Settings", menu=settings_menu)
+        settings_menu.add_command(label="Temp Backup Directory", command=self._show_backup_dir_settings)
 
         # Help Menu
         help_menu = ttk.Menu(menubar, tearoff=0)
@@ -927,12 +936,13 @@ class MainWindow:
             # Disable UI during cleanup
             self._set_ui_enabled(False)
 
-            # Create cleanup engine
+            # Create cleanup engine with temp backup directory setting
             self.cleanup_engine = CleanupEngine(
                 self.source_disk,
                 self.source_layout,
                 self.target_layout,
-                self.cleanup_options
+                self.cleanup_options,
+                temp_backup_dir=self.temp_backup_dir
             )
 
             # Connect progress callbacks
@@ -1462,3 +1472,133 @@ Made for the Nintendo Switch homebrew community
         except Exception:
             # Silently ignore errors loading preferences
             pass
+
+    def _load_settings(self):
+        """Load application settings"""
+        try:
+            if os.path.exists('.nx_migrator_prefs.json'):
+                with open('.nx_migrator_prefs.json', 'r') as f:
+                    prefs = json.load(f)
+                    self.temp_backup_dir = prefs.get('temp_backup_dir', None)
+        except Exception:
+            pass
+
+    def _save_settings(self):
+        """Save application settings"""
+        try:
+            prefs = {}
+            # Load existing prefs first to preserve log_panel_visible
+            if os.path.exists('.nx_migrator_prefs.json'):
+                with open('.nx_migrator_prefs.json', 'r') as f:
+                    prefs = json.load(f)
+
+            # Update with current settings
+            prefs['temp_backup_dir'] = self.temp_backup_dir
+
+            with open('.nx_migrator_prefs.json', 'w') as f:
+                json.dump(prefs, f)
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Could not save settings: {e}")
+
+    def _show_backup_dir_settings(self):
+        """Show dialog to configure temp backup directory"""
+        # Create dialog
+        dialog = ttk.Toplevel(self.root)
+        dialog.title("Temp Backup Directory Settings")
+        dialog.transient(self.root)
+        dialog.withdraw()
+        dialog.grab_set()
+
+        # Set size
+        width = 600
+        height = 330
+
+        # Main frame
+        main_frame = ttk.Frame(dialog, padding=20)
+        main_frame.pack(fill=BOTH, expand=True)
+
+        # Title
+        ttk.Label(
+            main_frame,
+            text="⚙️ Temp Backup Directory",
+            font=("Segoe UI", 12, "bold")
+        ).pack(pady=(0, 15))
+
+        # Description
+        desc_text = (
+            "Cleanup mode backs up FAT32 data to a temporary folder before\n"
+            "wiping the SD card. By default, the system temp folder is used.\n\n"
+            "You can specify a custom location if your C: drive has limited space."
+        )
+        ttk.Label(main_frame, text=desc_text, justify=CENTER).pack(pady=(0, 15))
+
+        # Path display frame
+        path_frame = ttk.Frame(main_frame)
+        path_frame.pack(fill=X, pady=(0, 10))
+
+        ttk.Label(path_frame, text="Current location:", font=("Segoe UI", 9)).pack(side=LEFT)
+
+        current_path = self.temp_backup_dir if self.temp_backup_dir else "System default (temp folder)"
+        path_label = ttk.Label(path_frame, text=current_path, font=("Segoe UI", 9, "bold"), foreground="#28a745")
+        path_label.pack(side=LEFT, padx=(10, 0))
+
+        # Button frame
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(pady=(10, 0))
+
+        def browse_folder():
+            from tkinter import filedialog
+            folder = filedialog.askdirectory(
+                title="Select Temp Backup Directory",
+                initialdir=self.temp_backup_dir if self.temp_backup_dir else os.path.expanduser("~")
+            )
+            if folder:
+                self.temp_backup_dir = folder
+                path_label.config(text=folder)
+                self._save_settings()
+                self._update_status(f"Temp backup directory set to: {folder}")
+
+        def reset_to_default():
+            self.temp_backup_dir = None
+            path_label.config(text="System default (temp folder)")
+            self._save_settings()
+            self._update_status("Temp backup directory reset to system default")
+
+        ttk.Button(
+            button_frame,
+            text="📁 Browse...",
+            command=browse_folder,
+            bootstyle="info",
+            width=15
+        ).pack(side=LEFT, padx=5)
+
+        ttk.Button(
+            button_frame,
+            text="↺ Reset to Default",
+            command=reset_to_default,
+            bootstyle="secondary",
+            width=18
+        ).pack(side=LEFT, padx=5)
+
+        ttk.Button(
+            button_frame,
+            text="Close",
+            command=dialog.destroy,
+            bootstyle="primary",
+            width=12
+        ).pack(side=LEFT, padx=5)
+
+        # Center dialog
+        dialog.update_idletasks()
+        parent_x = self.root.winfo_x()
+        parent_y = self.root.winfo_y()
+        parent_w = self.root.winfo_width()
+        parent_h = self.root.winfo_height()
+        x = parent_x + (parent_w // 2) - (width // 2)
+        y = parent_y + (parent_h // 2) - (height // 2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        dialog.deiconify()
+        dialog.lift()
+        dialog.attributes('-topmost', True)
+        dialog.after(100, lambda: dialog.attributes('-topmost', False))
+        dialog.focus_force()

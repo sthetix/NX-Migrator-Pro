@@ -108,10 +108,10 @@ class MigrationEngine:
                     break
             if fat32_part:
                 logger.info("Waiting for Windows to recognize new partitions...")
-                time.sleep(3)  # Give Windows extra time to recognize partitions
+                time.sleep(5)  # Give Windows more time to recognize partitions and release locks
                 logger.info("Refreshing disk before formatting...")
                 self._refresh_disk_partitions(self.target_disk['path'])
-                time.sleep(2)
+                time.sleep(3)  # Extra wait after refresh to ensure all handles are released
                 logger.info("Formatting FAT32 partition with fat32format.exe...")
                 self._create_fat32_filesystem(fat32_part)
 
@@ -173,9 +173,16 @@ class MigrationEngine:
         total_partitions = len(self.source_layout.partitions)
         base_progress = 15  # After partition table writing (10-15%)
 
-        # Prepare disk ONCE before copying all partitions (skip the slow diskpart operations per partition)
-        self._report_progress("Preparing Disk", base_progress, "Preparing target disk for data copy...")
-        self.disk_manager._prepare_disk_for_write(self.target_disk['path'])
+        # Check if we have any RAW partitions to copy (emuMMC, Linux, Android)
+        # Only prepare disk (which dismounts volumes) for RAW copies, not for FAT32 file copies
+        has_raw_partitions = any(
+            self._should_migrate_partition(p) and p.category != 'FAT32'
+            for p in self.source_layout.partitions
+        )
+
+        if has_raw_partitions:
+            self._report_progress("Preparing Disk", base_progress, "Preparing target disk for RAW data copy...")
+            self.disk_manager._prepare_disk_for_write(self.target_disk['path'])
 
         for idx, source_part in enumerate(self.source_layout.partitions):
             # Find corresponding target partition
@@ -882,6 +889,19 @@ assign
             logger.error(f"Error verifying/fixing FAT32 BPB: {e}")
             logger.warning("Continuing anyway - the partition may still work, but Hekate might see wrong size")
 
+        # CRITICAL: Remount the volume after BPB verification
+        # The dismount operation removed the drive letter, so we need to reassign it
+        # before file-level copy can proceed
+        logger.info("Remounting FAT32 volume after BPB update...")
+        if hasattr(self, 'target_fat32_drive') and self.target_fat32_drive:
+            # Reassign the same drive letter that was used before
+            try:
+                self._assign_and_lock_drive_letter(partition, self.target_fat32_drive)
+                logger.info(f"FAT32 volume remounted as {self.target_fat32_drive}")
+            except Exception as e:
+                logger.error(f"Failed to remount FAT32 volume: {e}")
+                raise Exception(f"Could not remount FAT32 volume for file copy: {e}")
+
     def _dismount_partition(self, partition):
         """Dismount/offline a partition using diskpart to release Windows locks"""
         try:
@@ -1120,58 +1140,22 @@ rescan
         if not Path(source).exists():
             raise Exception(f"Source path does not exist: {source}")
 
-        # Problematic directories to skip (these cause issues and don't need to be copied)
-        skipped_dirs = ['$Recycle.Bin', 'System Volume Information', '.Trashes',
-                        '$RECYCLE.BIN', 'RECYCLER', '.Trash-1000', '.Trash-1001',
-                        '.Trash-1002', 'found.000', 'FOUND.000']
-        logger.info(f"Will skip problematic directories: {', '.join(skipped_dirs)}")
-
-        # Count total size first for progress tracking using free space method (much faster, no timeout)
+        # Count total size first for progress tracking
         logger.info(f"Calculating total size...")
         self._report_progress(stage_name, base_progress, "Calculating copy size...")
 
-        # Get target drive initial free space
         try:
-            import ctypes
-            free_bytes = ctypes.c_ulonglong(0)
-            total_bytes = ctypes.c_ulonglong(0)
-            total_free_bytes = ctypes.c_ulonglong(0)
-            ctypes.windll.kernel32.GetDiskFreeSpaceExW(
-                ctypes.c_wchar_p(target),
-                ctypes.byref(free_bytes),
-                ctypes.byref(total_bytes),
-                ctypes.byref(total_free_bytes)
-            )
-            initial_free_space = free_bytes.value
-            logger.debug(f"Initial free space on target: {initial_free_space / (1024**3):.2f} GB")
-        except Exception as e:
-            logger.warning(f"Could not get initial free space: {e}")
-            initial_free_space = None
-
-        try:
-            # Use PowerShell to get total size with directory exclusion
-            # Skip problematic directories to avoid errors
-            exclude_pattern = '|'.join(skipped_dirs)
+            # Use PowerShell to get total size (faster than Python os.walk)
             size_cmd = f'''
-            $skippedDirs = @({', '.join([f"'{d}'" for d in skipped_dirs])})
-            $totalSize = 0
-            Get-ChildItem -Path "{source}" -Recurse -Force -ErrorAction SilentlyContinue | Where-Object {{
-                $skip = $false
-                foreach ($dir in $skippedDirs) {{
-                    if ($_.FullName -like "*\\$dir\\*" -or $_.FullName -like "*\\$dir") {{
-                        $skip = $true
-                        break
-                    }}
-                }}
-                -not $skip
-            }} | ForEach-Object {{ $totalSize += $_.Length }}
+            $totalSize = (Get-ChildItem -Path "{source}" -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+            if ($totalSize -eq $null) {{ $totalSize = 0 }}
             Write-Output $totalSize
             '''
             result = subprocess.run(
                 ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', size_cmd],
                 capture_output=True,
                 text=True,
-                timeout=120,  # Increased timeout for large directories
+                timeout=60,
                 creationflags=CREATE_NO_WINDOW
             )
             total_bytes = int(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else 0
@@ -1185,39 +1169,15 @@ rescan
         start_time = time.time()
 
         # PowerShell script for copying with progress tracking
-        # Skip problematic directories that cause issues
-        skipped_dirs_pattern = '|'.join([f'{d}' for d in skipped_dirs])
+        # Using -Force to overwrite, -Recurse for subdirectories
+        # This mimics Windows Explorer's copy behavior
         ps_script = f'''
         $ErrorActionPreference = "Continue"
-        $source = "{source}"
+        $source = "{source}\\*"
         $destination = "{target}"
-        $skippedDirs = @({', '.join([f"'{d}'" for d in skipped_dirs])})
 
-        # Get all items except skipped directories
-        Get-ChildItem -Path $source -Force -ErrorAction SilentlyContinue | Where-Object {{
-            $name = $_.Name
-            $isSkipped = $false
-            foreach ($dir in $skippedDirs) {{
-                if ($name -eq $dir) {{
-                    $isSkipped = $true
-                    break
-                }}
-            }}
-            -not $isSkipped
-        }} | ForEach-Object {{
-            if ($_.PSIsContainer) {{
-                # Copy directory recursively, excluding problematic subdirectories
-                $destPath = Join-Path $destination $_.Name
-                if (-not (Test-Path $destPath)) {{
-                    New-Item -ItemType Directory -Path $destPath -Force | Out-Null
-                }}
-                # Copy contents recursively
-                Copy-Item -Path (Join-Path $source $_.Name "\\*") -Destination $destPath -Recurse -Force -ErrorAction Continue
-            }} else {{
-                # Copy file
-                Copy-Item -Path $_.FullName -Destination $destination -Force -ErrorAction Continue
-            }}
-        }}
+        # Copy all items recursively (like Windows Explorer)
+        Copy-Item -Path $source -Destination $destination -Recurse -Force -ErrorAction Continue
 
         if ($?) {{
             Write-Output "SUCCESS"
@@ -1239,8 +1199,7 @@ rescan
                 creationflags=CREATE_NO_WINDOW
             )
 
-            # Monitor progress by checking target directory size using free space method
-            # This is O(1) operation and won't timeout like Get-ChildItem -Recurse
+            # Monitor progress by checking target directory size
             last_check_time = time.time()
             check_interval = 2.0  # Check every 2 seconds
 
@@ -1252,34 +1211,34 @@ rescan
                 current_time = time.time()
                 if current_time - last_check_time >= check_interval:
                     try:
-                        # Use free space method to calculate progress (instant, no timeout)
-                        if initial_free_space is not None:
-                            try:
-                                current_free_bytes = ctypes.c_ulonglong(0)
-                                ctypes.windll.kernel32.GetDiskFreeSpaceExW(
-                                    ctypes.c_wchar_p(target),
-                                    ctypes.byref(current_free_bytes),
-                                    ctypes.byref(total_bytes),
-                                    ctypes.byref(total_free_bytes)
-                                )
-                                copied_bytes = initial_free_space - current_free_bytes.value
+                        # Check how much has been copied so far
+                        size_check_cmd = f'''
+                        $copiedSize = (Get-ChildItem -Path "{target}" -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                        if ($copiedSize -eq $null) {{ $copiedSize = 0 }}
+                        Write-Output $copiedSize
+                        '''
+                        size_result = subprocess.run(
+                            ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', size_check_cmd],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                            creationflags=CREATE_NO_WINDOW
+                        )
+                        copied_bytes = int(size_result.stdout.strip()) if size_result.returncode == 0 and size_result.stdout.strip() else 0
 
-                                # Calculate progress
-                                elapsed = current_time - start_time
-                                speed_mbps = (copied_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                                copied_gb = copied_bytes / (1024**3)
+                        # Calculate progress
+                        elapsed = current_time - start_time
+                        speed_mbps = (copied_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                        copied_gb = copied_bytes / (1024**3)
 
-                                if total_bytes > 0:
-                                    percent = min(95, (copied_bytes / total_bytes * 100))  # Cap at 95% until confirmed done
-                                    progress = base_progress + (percent / 100 * progress_range * 0.9)
-                                    logger.info(f"Copying: {copied_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%) at {speed_mbps:.1f} MB/s")
-                                    self._report_progress(stage_name, progress, f"Copied {copied_gb:.1f}/{total_gb:.1f} GB ({percent:.0f}%)")
-                                else:
-                                    logger.info(f"Copying: {copied_gb:.2f} GB at {speed_mbps:.1f} MB/s")
-                                    self._report_progress(stage_name, base_progress + 30, f"Copied {copied_gb:.1f} GB")
-
-                            except Exception as inner_e:
-                                logger.debug(f"Could not check progress using free space: {inner_e}")
+                        if total_bytes > 0:
+                            percent = min(95, (copied_bytes / total_bytes * 100))  # Cap at 95% until confirmed done
+                            progress = base_progress + (percent / 100 * progress_range * 0.9)
+                            logger.info(f"Copying: {copied_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%) at {speed_mbps:.1f} MB/s")
+                            self._report_progress(stage_name, progress, f"Copied {copied_gb:.1f}/{total_gb:.1f} GB ({percent:.0f}%)")
+                        else:
+                            logger.info(f"Copying: {copied_gb:.2f} GB at {speed_mbps:.1f} MB/s")
+                            self._report_progress(stage_name, base_progress + 30, f"Copied {copied_gb:.1f} GB")
 
                         last_check_time = current_time
 
@@ -1437,17 +1396,7 @@ rescan
 
                 except Exception as e:
                     logger.warning(f"Archive bit fix failed: {e}")
-                    logger.warning("=" * 60)
-                    logger.warning("ARCHIVE BIT FIX INSTRUCTIONS:")
-                    logger.warning("The file copy completed successfully, but the automatic")
-                    logger.warning("Archive bit fix encountered an error.")
-                    logger.warning("")
-                    logger.warning("This is NOT critical - your SD card should still work.")
-                    logger.warning("If you experience issues with file detection:")
-                    logger.warning("1. Boot Hekate on your Switch")
-                    logger.warning("2. Go to Tools -> Fix Archive Bit")
-                    logger.warning("3. Select your SD card and run the fix")
-                    logger.warning("=" * 60)
+                    logger.warning("You may need to use Hekate 'Fix Archive Bit' tool manually")
 
                 # Final progress
                 final_progress = min(100, base_progress + progress_range)
