@@ -1018,7 +1018,7 @@ class MainWindow:
                     f"The SD card may be in an inconsistent state.\n"
                     f"Please restore from backup if needed.",
                     width=550,
-                    height=300
+                    height=390
                 )
 
         self.root.after(0, error_ui)
@@ -1100,6 +1100,8 @@ class MainWindow:
 
         # Update geometry and calculate centered position
         dialog.update_idletasks()
+        width = max(width, dialog.winfo_reqwidth())
+        height = max(height, dialog.winfo_reqheight())
 
         # Get parent window position
         parent_x = parent_window.winfo_x()
