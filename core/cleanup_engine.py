@@ -128,10 +128,11 @@ class CleanupEngine:
         # Use user-specified directory if provided, otherwise use system temp
         if self.temp_backup_dir_setting:
             # Use custom directory
-            import shutil
-            custom_temp = os.path.join(self.temp_backup_dir_setting, "nx_partition_backup_")
-            os.makedirs(custom_temp, exist_ok=True)
-            self.temp_backup_dir = custom_temp
+            os.makedirs(self.temp_backup_dir_setting, exist_ok=True)
+            self.temp_backup_dir = tempfile.mkdtemp(
+                prefix="nx_partition_backup_",
+                dir=self.temp_backup_dir_setting
+            )
             logger.info(f"Using custom temp backup directory: {self.temp_backup_dir}")
         else:
             # Use system temp directory
@@ -445,12 +446,12 @@ class CleanupEngine:
         try:
             import ctypes
             free_bytes = ctypes.c_ulonglong(0)
-            total_bytes = ctypes.c_ulonglong(0)
+            total_disk_bytes = ctypes.c_ulonglong(0)
             total_free_bytes = ctypes.c_ulonglong(0)
             ctypes.windll.kernel32.GetDiskFreeSpaceExW(
                 ctypes.c_wchar_p(target),
                 ctypes.byref(free_bytes),
-                ctypes.byref(total_bytes),
+                ctypes.byref(total_disk_bytes),
                 ctypes.byref(total_free_bytes)
             )
             initial_free_space = free_bytes.value
@@ -484,13 +485,13 @@ class CleanupEngine:
                 timeout=120,
                 creationflags=CREATE_NO_WINDOW
             )
-            total_bytes = int(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else 0
-            total_gb = total_bytes / (1024**3)
-            logger.info(f"Total size to copy: {total_gb:.2f} GB ({total_bytes:,} bytes)")
+            total_copy_bytes = int(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else 0
+            total_gb = total_copy_bytes / (1024**3)
+            logger.info(f"Total size to copy: {total_gb:.2f} GB ({total_copy_bytes:,} bytes)")
 
         except Exception as e:
             logger.warning(f"Could not calculate total size: {e}. Proceeding with copy...")
-            total_bytes = 0
+            total_copy_bytes = 0
 
         start_time = time.time()
 
@@ -568,7 +569,7 @@ class CleanupEngine:
                                 ctypes.windll.kernel32.GetDiskFreeSpaceExW(
                                     ctypes.c_wchar_p(target),
                                     ctypes.byref(current_free_bytes),
-                                    ctypes.byref(total_bytes),
+                                    ctypes.byref(total_disk_bytes),
                                     ctypes.byref(total_free_bytes)
                                 )
                                 copied_bytes = initial_free_space - current_free_bytes.value
@@ -578,8 +579,8 @@ class CleanupEngine:
                                 speed_mbps = (copied_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
                                 copied_gb = copied_bytes / (1024**3)
 
-                                if total_bytes > 0:
-                                    percent = min(95, (copied_bytes / total_bytes * 100))
+                                if total_copy_bytes > 0:
+                                    percent = min(95, (copied_bytes / total_copy_bytes * 100))
                                     progress = base_progress + (percent / 100 * progress_range * 0.9)
                                     logger.info(f"Copying: {copied_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%) at {speed_mbps:.1f} MB/s")
                                     self._report_progress(stage_name, progress, f"Copied {copied_gb:.1f}/{total_gb:.1f} GB ({percent:.0f}%)")
@@ -603,7 +604,13 @@ class CleanupEngine:
             elapsed_time = time.time() - start_time
 
             # Check if copy was successful
-            if "SUCCESS" in stdout or "COMPLETED_WITH_ERRORS" in stdout:
+            if "COMPLETED_WITH_ERRORS" in stdout:
+                logger.error("Copy completed with errors; treating as failed to avoid incomplete FAT32 data.")
+                if stderr:
+                    logger.error(f"PowerShell errors: {stderr}")
+                raise Exception("Windows copy operation completed with errors. Check logs for skipped files.")
+
+            if "SUCCESS" in stdout:
                 # Initialize final_gb to avoid UnboundLocalError if exception occurs
                 final_gb = 0.0
 
@@ -628,11 +635,6 @@ class CleanupEngine:
 
                     logger.info(f"Windows copy completed in {elapsed_time:.1f} seconds")
                     logger.info(f"Data copied: {final_gb:.2f} GB ({final_bytes:,} bytes) at {speed_mbps:.1f} MB/s")
-
-                    if "COMPLETED_WITH_ERRORS" in stdout:
-                        logger.warning("Copy completed but some files may have been skipped (check PowerShell errors)")
-                        if stderr:
-                            logger.warning(f"PowerShell errors: {stderr[:500]}")
 
                     # Final progress - but reserve a bit for Archive bit fix
                     copy_progress = base_progress + int(progress_range * 0.95)

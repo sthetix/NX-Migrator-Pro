@@ -1121,62 +1121,83 @@ rescan
             logger.warning(f"Could not refresh disk partitions: {e}")
 
     def _copy_files_simple(self, source_drive, target_drive, stage_name, base_progress, progress_range=60):
-        """Copy files using Windows native PowerShell Copy-Item - same as Windows Explorer
+        """Copy files using Windows native PowerShell Copy-Item with source-based progress tracking.
+
+        This method fixes the progress-stall issue by:
+        1. Building the full file list from SOURCE upfront (read-only, no lock contention)
+        2. Tracking progress by measuring TARGET file sizes (non-recursive, no volume lock)
+        3. Using a sampling strategy to avoid reading thousands of files per check
 
         Args:
             progress_range: Total progress range allocated for file copy (default 60)
         """
-        import os
-        from pathlib import Path
-
         # Ensure drive letters are properly formatted
         source = source_drive.rstrip('\\')
         target = target_drive.rstrip('\\')
 
         logger.info(f"Starting Windows native file copy: {source} -> {target}")
-        logger.info(f"Using PowerShell Copy-Item (same as Windows Explorer)")
+        logger.info(f"Using PowerShell Copy-Item with source-based progress tracking")
 
         # Verify source path exists
         if not Path(source).exists():
             raise Exception(f"Source path does not exist: {source}")
 
-        # Count total size first for progress tracking
-        logger.info(f"Calculating total size...")
-        self._report_progress(stage_name, base_progress, "Calculating copy size...")
+        # =============================================================
+        # STEP 1: Build the full file manifest from SOURCE upfront
+        # This is read-only and has NO lock contention
+        # =============================================================
+        logger.info("Building file manifest from source (no lock contention)...")
+        self._report_progress(stage_name, base_progress, "Scanning source files...")
+
+        file_list = []  # List of (relative_path, size_bytes)
+        total_bytes = 0
+        largest_sample_indices = []
+        sample_points = 0
+        sample_offset = 0
+        last_estimated_total = 0
 
         try:
-            # Use PowerShell to get total size (faster than Python os.walk)
-            size_cmd = f'''
-            $totalSize = (Get-ChildItem -Path "{source}" -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
-            if ($totalSize -eq $null) {{ $totalSize = 0 }}
-            Write-Output $totalSize
-            '''
-            result = subprocess.run(
-                ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', size_cmd],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                creationflags=CREATE_NO_WINDOW
-            )
-            total_bytes = int(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else 0
+            for dirpath, dirnames, filenames in os.walk(source):
+                for filename in filenames:
+                    filepath = os.path.join(dirpath, filename)
+                    try:
+                        size = os.path.getsize(filepath)
+                        rel_path = os.path.relpath(filepath, source)
+                        file_list.append((rel_path, size))
+                        total_bytes += size
+                    except (OSError, PermissionError) as e:
+                        logger.debug(f"Could not get size of {filepath}: {e}")
+
             total_gb = total_bytes / (1024**3)
-            logger.info(f"Total size to copy: {total_gb:.2f} GB ({total_bytes:,} bytes)")
+            logger.info(f"File manifest built: {len(file_list)} files, {total_gb:.2f} GB total")
+
+            if file_list:
+                # Always track the largest files explicitly so progress does not
+                # appear frozen when Copy-Item is busy on a single huge file.
+                largest_sample_count = min(12, len(file_list))
+                largest_sample_indices = [
+                    idx for idx, _ in sorted(
+                        enumerate(file_list),
+                        key=lambda item: item[1][1],
+                        reverse=True
+                    )[:largest_sample_count]
+                ]
+                sample_points = min(64, len(file_list))
 
         except Exception as e:
-            logger.warning(f"Could not calculate total size: {e}. Proceeding with copy...")
+            logger.warning(f"Could not build file manifest: {e}. Using time-based progress.")
+            file_list = []
             total_bytes = 0
+            total_gb = 0
 
-        start_time = time.time()
-
-        # PowerShell script for copying with progress tracking
-        # Using -Force to overwrite, -Recurse for subdirectories
-        # This mimics Windows Explorer's copy behavior
+        # =============================================================
+        # STEP 2: Launch Copy-Item in background
+        # =============================================================
         ps_script = f'''
         $ErrorActionPreference = "Continue"
         $source = "{source}\\*"
         $destination = "{target}"
 
-        # Copy all items recursively (like Windows Explorer)
         Copy-Item -Path $source -Destination $destination -Recurse -Force -ErrorAction Continue
 
         if ($?) {{
@@ -1186,236 +1207,233 @@ rescan
         }}
         '''
 
-        logger.info(f"Executing Windows copy operation...")
-        self._report_progress(stage_name, base_progress + 5, "Copying files with Windows native method...")
+        logger.info("Executing Windows copy operation...")
+        self._report_progress(stage_name, base_progress + 5, "Copying files...")
 
-        try:
-            # Run PowerShell copy in background and monitor progress
-            process = subprocess.Popen(
-                ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps_script],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                creationflags=CREATE_NO_WINDOW
-            )
+        process = subprocess.Popen(
+            ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=CREATE_NO_WINDOW
+        )
 
-            # Monitor progress by checking target directory size
-            last_check_time = time.time()
-            check_interval = 2.0  # Check every 2 seconds
+        # =============================================================
+        # STEP 3: Progress monitoring using SOURCE-BASED tracking
+        # We check which source files have appeared on the target,
+        # measuring only a SAMPLE of target files to avoid lock contention
+        # =============================================================
+        start_time = time.time()
+        last_progress_update = 0.0
+        last_log_time = start_time
+        last_check_time = start_time
+        check_interval = 2.0  # Check every 2 seconds
+        heartbeat_sent = False
 
-            while process.poll() is None:
-                if self.cancelled:
-                    process.kill()
-                    raise Exception("Migration cancelled by user")
+        while process.poll() is None:
+            if self.cancelled:
+                process.kill()
+                raise Exception("Migration cancelled by user")
 
-                current_time = time.time()
-                if current_time - last_check_time >= check_interval:
-                    try:
-                        # Check how much has been copied so far
-                        size_check_cmd = f'''
-                        $copiedSize = (Get-ChildItem -Path "{target}" -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
-                        if ($copiedSize -eq $null) {{ $copiedSize = 0 }}
-                        Write-Output $copiedSize
-                        '''
-                        size_result = subprocess.run(
-                            ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', size_check_cmd],
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
-                            creationflags=CREATE_NO_WINDOW
-                        )
-                        copied_bytes = int(size_result.stdout.strip()) if size_result.returncode == 0 and size_result.stdout.strip() else 0
+            current_time = time.time()
+            elapsed = current_time - start_time
 
-                        # Calculate progress
-                        elapsed = current_time - start_time
-                        speed_mbps = (copied_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                        copied_gb = copied_bytes / (1024**3)
+            if current_time - last_check_time >= check_interval:
+                try:
+                    if file_list:
+                        # =============================================================
+                        # SOURCE-BASED PROGRESS: Count which files have appeared on target
+                        # We check every Nth file (sampling) to avoid reading thousands
+                        # of files per check — this is fast and has no lock contention
+                        # =============================================================
+                        sample_step = max(1, len(file_list) // max(1, sample_points))
+                        copied_bytes = 0
+                        files_checked = 0
+                        sampled_indices = set(largest_sample_indices)
 
-                        if total_bytes > 0:
-                            percent = min(95, (copied_bytes / total_bytes * 100))  # Cap at 95% until confirmed done
-                            progress = base_progress + (percent / 100 * progress_range * 0.9)
-                            logger.info(f"Copying: {copied_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%) at {speed_mbps:.1f} MB/s")
-                            self._report_progress(stage_name, progress, f"Copied {copied_gb:.1f}/{total_gb:.1f} GB ({percent:.0f}%)")
+                        # Rotate the stride start each pass so different parts of
+                        # the tree get measured over time instead of re-checking
+                        # the exact same files forever.
+                        for i in range(sample_offset, len(file_list), sample_step):
+                            sampled_indices.add(i)
+
+                        sample_offset = (sample_offset + 1) % sample_step
+
+                        for i in sorted(sampled_indices):
+                            rel_path, size = file_list[i]
+                            target_path = os.path.join(target, rel_path)
+                            try:
+                                if os.path.exists(target_path):
+                                    # Only count if it's actually the same size or larger
+                                    # (partially-written files won't show inflated progress)
+                                    actual_size = os.path.getsize(target_path)
+                                    if actual_size >= size:
+                                        copied_bytes += size
+                                    elif actual_size > 0:
+                                        # File exists but not yet complete — count partial
+                                        copied_bytes += actual_size
+                                files_checked += 1
+                            except (OSError, PermissionError):
+                                pass
+
+                        if total_bytes > 0 and files_checked > 0:
+                            # Estimate total based on checked sample
+                            sampled_ratio = files_checked / len(file_list)
+                            estimated_total = copied_bytes / sampled_ratio if sampled_ratio > 0 else 0
+                            estimated_total = max(last_estimated_total, estimated_total)
+                            last_estimated_total = estimated_total
+                            percent = min(95, (estimated_total / total_bytes * 100))
                         else:
-                            logger.info(f"Copying: {copied_gb:.2f} GB at {speed_mbps:.1f} MB/s")
-                            self._report_progress(stage_name, base_progress + 30, f"Copied {copied_gb:.1f} GB")
+                            estimated_total = last_estimated_total
+                            percent = 0
 
-                        last_check_time = current_time
+                        speed_mbps = (estimated_total / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                        copied_gb = estimated_total / (1024**3)
 
-                    except Exception as e:
-                        logger.debug(f"Could not check copy progress: {e}")
+                        # Update progress
+                        progress = base_progress + (percent / 100 * progress_range * 0.9)
+                        logger.info(f"Copying: {copied_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%) at {speed_mbps:.1f} MB/s")
+                        self._report_progress(stage_name, progress, f"Copied {copied_gb:.1f}/{total_gb:.1f} GB ({percent:.0f}%)")
+                        last_progress_update = percent
+                        heartbeat_sent = False
 
-                time.sleep(0.5)
-
-            # Get final output
-            stdout, stderr = process.communicate()
-
-            elapsed_time = time.time() - start_time
-
-            # Check if copy was successful
-            if "SUCCESS" in stdout or "COMPLETED_WITH_ERRORS" in stdout:
-                # Initialize final_gb to avoid UnboundLocalError if exception occurs
-                final_gb = 0.0
-
-                # Get final copied size
-                try:
-                    size_check_cmd = f'''
-                    $copiedSize = (Get-ChildItem -Path "{target}" -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
-                    if ($copiedSize -eq $null) {{ $copiedSize = 0 }}
-                    Write-Output $copiedSize
-                    '''
-                    size_result = subprocess.run(
-                        ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', size_check_cmd],
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                        creationflags=CREATE_NO_WINDOW
-                    )
-                    final_bytes = int(size_result.stdout.strip()) if size_result.returncode == 0 and size_result.stdout.strip() else 0
-                    final_gb = final_bytes / (1024**3)
-                    final_mb = final_bytes / (1024 * 1024)
-                    speed_mbps = final_mb / elapsed_time if elapsed_time > 0 else 0
-
-                    logger.info(f"Windows copy completed in {elapsed_time:.1f} seconds")
-                    logger.info(f"Data copied: {final_gb:.2f} GB ({final_bytes:,} bytes) at {speed_mbps:.1f} MB/s")
-
-                    if "COMPLETED_WITH_ERRORS" in stdout:
-                        logger.warning("Copy completed but some files may have been skipped (check PowerShell errors)")
-                        if stderr:
-                            logger.warning(f"PowerShell errors: {stderr[:500]}")  # Log first 500 chars of errors
-
-                    # Final progress - but reserve a bit for Archive bit fix
-                    copy_progress = min(95, base_progress + progress_range * 0.95)
-                    self._report_progress(stage_name, copy_progress, f"✓ Copied {final_gb:.1f} GB - Fixing Archive bits...")
-
-                except Exception as e:
-                    logger.warning(f"Could not get final copy size: {e}")
-                    copy_progress = min(95, base_progress + progress_range * 0.95)
-                    self._report_progress(stage_name, copy_progress, "✓ Copy completed - Fixing Archive bits...")
-
-                # Fix Archive bit for Nintendo Switch compatibility using Hekate's logic
-                # Hekate's behavior (from hekate-ext/nyx/nyx_gui/frontend/gui_tools.c):
-                # - SET Archive bit on HOS single file folders (those containing a "/00" file)
-                # - CLEAR Archive bit on all other folders
-                logger.info("Fixing Archive bits for Nintendo Switch compatibility (Hekate logic)...")
-                logger.info("Scanning folders for HOS single file containers...")
-
-                try:
-                    fix_start = time.time()
-
-                    # PowerShell script implementing Hekate's Archive bit fix logic
-                    # This matches the behavior in hekate-ext/nyx/nyx_gui/frontend/gui_tools.c _fix_attributes()
-                    fix_script = f'''
-                    $ErrorActionPreference = "Continue"
-                    $targetPath = "{target}"
-
-                    # Counters (matching Hekate's total[] array)
-                    $bitsSet = 0      # Archive bits SET (HOS folders)
-                    $bitsUnset = 0    # Archive bits UNSET (regular folders)
-                    $errors = 0       # Errors encountered
-
-                    # Get all directories recursively
-                    $directories = Get-ChildItem -Path $targetPath -Directory -Recurse -Force -ErrorAction SilentlyContinue
-
-                    Write-Output "Found $($directories.Count) directories to process"
-
-                    foreach ($dir in $directories) {{
-                        try {{
-                            # Check if this is a HOS single file folder by looking for "/00" file
-                            $hosMarkerFile = Join-Path $dir.FullName "00"
-                            $isHosFolder = Test-Path -Path $hosMarkerFile -PathType Leaf
-
-                            # Get current attributes
-                            $currentAttrib = $dir.Attributes
-                            $hasArchiveBit = ($currentAttrib -band [System.IO.FileAttributes]::Archive) -ne 0
-
-                            if ($isHosFolder) {{
-                                # HOS single file folder - SET Archive bit if not already set
-                                if (-not $hasArchiveBit) {{
-                                    $dir.Attributes = $currentAttrib -bor [System.IO.FileAttributes]::Archive
-                                    $bitsSet++
-                                }}
-                            }} else {{
-                                # Regular folder - CLEAR Archive bit if set
-                                if ($hasArchiveBit) {{
-                                    $dir.Attributes = $currentAttrib -band (-bnot [System.IO.FileAttributes]::Archive)
-                                    $bitsUnset++
-                                }}
-                            }}
-                        }} catch {{
-                            $errors++
-                        }}
-                    }}
-
-                    Write-Output "ARCHIVE_FIX_COMPLETE"
-                    Write-Output "BitsSet:$bitsSet"
-                    Write-Output "BitsUnset:$bitsUnset"
-                    Write-Output "Errors:$errors"
-                    '''
-
-                    logger.info("Running Hekate-style Archive bit fix...")
-                    self._report_progress(stage_name, copy_progress + 2, "Fixing Archive bits (Hekate logic)...")
-
-                    fix_result = subprocess.run(
-                        ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', fix_script],
-                        capture_output=True,
-                        text=True,
-                        timeout=300,  # 5 minute timeout for Archive bit fix
-                        creationflags=CREATE_NO_WINDOW
-                    )
-
-                    fix_elapsed = time.time() - fix_start
-
-                    if "ARCHIVE_FIX_COMPLETE" in fix_result.stdout:
-                        # Parse the results
-                        output_lines = fix_result.stdout.strip().split('\n')
-                        bits_set = 0
-                        bits_unset = 0
-                        errors = 0
-
-                        for line in output_lines:
-                            if line.startswith("BitsSet:"):
-                                bits_set = int(line.split(':')[1])
-                            elif line.startswith("BitsUnset:"):
-                                bits_unset = int(line.split(':')[1])
-                            elif line.startswith("Errors:"):
-                                errors = int(line.split(':')[1])
-
-                        logger.info(f"Archive bit fix completed in {fix_elapsed:.1f}s")
-                        logger.info(f"Archive bits SET (HOS folders): {bits_set}")
-                        logger.info(f"Archive bits UNSET (regular folders): {bits_unset}")
-
-                        if errors > 0:
-                            logger.warning(f"Encountered {errors} errors during Archive bit fix")
-
-                        logger.info("Nintendo Switch should now recognize all files correctly!")
                     else:
-                        logger.warning("Archive bit fix may have encountered issues")
-                        if fix_result.stderr:
-                            logger.warning(f"Fix errors: {fix_result.stderr[:200]}")
+                        # No file manifest — use time-based heartbeat progress
+                        # Show steady "copying" progress without stalling
+                        time_percent = min(85, (elapsed / 60) * 30)  # Fake 0-85% over 60 min
+                        if not heartbeat_sent or (elapsed - last_log_time) >= 15:
+                            logger.info(f"Copying: time-based progress {time_percent:.0f}% (manifest unavailable)")
+                            self._report_progress(stage_name, base_progress + 5 + time_percent, f"Copying... {elapsed/60:.0f}m elapsed")
+                            last_log_time = elapsed
+                            heartbeat_sent = True
 
                 except Exception as e:
-                    logger.warning(f"Archive bit fix failed: {e}")
-                    logger.warning("You may need to use Hekate 'Fix Archive Bit' tool manually")
+                    # If even the sampling fails, log but don't crash
+                    logger.debug(f"Progress check error (non-fatal): {e}")
+                    if not heartbeat_sent:
+                        logger.info(f"Copying... (progress monitoring temporarily unavailable)")
+                        heartbeat_sent = True
 
-                # Final progress
-                final_progress = min(100, base_progress + progress_range)
-                self._report_progress(stage_name, final_progress, f"✓ Copied {final_gb:.1f} GB + Archive fix in {elapsed_time:.0f}s")
+                last_check_time = current_time
 
-                logger.info("FAT32 file copy completed successfully using Windows native method")
+            time.sleep(0.5)
 
-            else:
-                logger.error(f"PowerShell copy failed with return code: {process.returncode}")
-                if stderr:
-                    logger.error(f"PowerShell errors: {stderr}")
-                raise Exception(f"Windows copy operation failed. Check logs for details.")
+        # =============================================================
+        # STEP 4: Copy completed — get final state
+        # =============================================================
+        stdout, stderr = process.communicate()
+        elapsed_time = time.time() - start_time
 
-        except subprocess.TimeoutExpired:
-            process.kill()
-            raise Exception("Windows copy operation timed out")
-        except Exception as e:
-            logger.error(f"Windows copy error: {e}")
-            raise
+        if "COMPLETED_WITH_ERRORS" in stdout:
+            logger.error("Copy completed with errors; treating as failed to avoid incomplete FAT32 data.")
+            if stderr:
+                logger.error(f"PowerShell errors: {stderr}")
+            raise Exception("Windows copy operation completed with errors. Check logs for skipped files.")
+
+        if "SUCCESS" in stdout:
+            final_gb = 0.0
+
+            # Get final size from target
+            try:
+                final_bytes = 0
+                for rel_path, size in file_list:
+                    target_path = os.path.join(target, rel_path)
+                    try:
+                        if os.path.exists(target_path) and os.path.getsize(target_path) >= size:
+                            final_bytes += size
+                    except (OSError, PermissionError):
+                        pass
+
+                final_gb = final_bytes / (1024**3)
+                final_mb = final_bytes / (1024 * 1024)
+                speed_mbps = final_mb / elapsed_time if elapsed_time > 0 else 0
+
+                logger.info(f"Windows copy completed in {elapsed_time:.1f} seconds")
+                logger.info(f"Data copied: {final_gb:.2f} GB ({final_bytes:,} bytes) at {speed_mbps:.1f} MB/s")
+
+            except Exception as e:
+                logger.warning(f"Could not get final copy size: {e}")
+
+            copy_progress = min(95, base_progress + progress_range * 0.95)
+            self._report_progress(stage_name, copy_progress, f"✓ Copied {final_gb:.1f} GB - Fixing Archive bits...")
+
+            # =============================================================
+            # STEP 5: Fix Archive bits (Hekate logic) — unchanged from original
+            # =============================================================
+            logger.info("Fixing Archive bits for Nintendo Switch compatibility (Hekate logic)...")
+
+            try:
+                fix_script = f'''
+                $ErrorActionPreference = "Continue"
+                $targetPath = "{target}"
+
+                $bitsSet = 0
+                $bitsUnset = 0
+                $errors = 0
+
+                $directories = Get-ChildItem -Path $targetPath -Directory -Recurse -Force -ErrorAction SilentlyContinue
+
+                foreach ($dir in $directories) {{
+                    try {{
+                        $hosMarkerFile = Join-Path $dir.FullName "00"
+                        $isHosFolder = Test-Path -Path $hosMarkerFile -PathType Leaf
+                        $currentAttrib = $dir.Attributes
+                        $hasArchiveBit = ($currentAttrib -band [System.IO.FileAttributes]::Archive) -ne 0
+
+                        if ($isHosFolder) {{
+                            if (-not $hasArchiveBit) {{
+                                $dir.Attributes = $currentAttrib -bor [System.IO.FileAttributes]::Archive
+                                $bitsSet++
+                            }}
+                        }} else {{
+                            if ($hasArchiveBit) {{
+                                $dir.Attributes = $currentAttrib -band (-bnot [System.IO.FileAttributes]::Archive)
+                                $bitsUnset++
+                            }}
+                        }}
+                    }} catch {{
+                        $errors++
+                    }}
+                }}
+
+                Write-Output "ARCHIVE_FIX_COMPLETE"
+                Write-Output "BitsSet:$bitsSet"
+                Write-Output "BitsUnset:$bitsUnset"
+                Write-Output "Errors:$errors"
+                '''
+
+                logger.info("Running Hekate-style Archive bit fix...")
+                self._report_progress(stage_name, copy_progress + 2, "Fixing Archive bits...")
+
+                fix_result = subprocess.run(
+                    ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', fix_script],
+                    capture_output=True, text=True, timeout=300,
+                    creationflags=CREATE_NO_WINDOW
+                )
+
+                if "ARCHIVE_FIX_COMPLETE" in fix_result.stdout:
+                    for line in fix_result.stdout.strip().split('\n'):
+                        if line.startswith("BitsSet:"):
+                            logger.info(f"Archive bits SET (HOS folders): {line.split(':')[1]}")
+                        elif line.startswith("BitsUnset:"):
+                            logger.info(f"Archive bits UNSET (regular folders): {line.split(':')[1]}")
+
+                    logger.info("Nintendo Switch should now recognize all files correctly!")
+                else:
+                    logger.warning("Archive bit fix may have encountered issues")
+
+            except Exception as e:
+                logger.warning(f"Archive bit fix failed: {e}")
+
+            final_progress = min(100, base_progress + progress_range)
+            self._report_progress(stage_name, final_progress, f"✓ Copy done in {elapsed_time/60:.0f}m")
+            logger.info("FAT32 file copy completed successfully")
+
+        else:
+            logger.error(f"PowerShell copy failed: {process.returncode}")
+            if stderr:
+                logger.error(f"PowerShell errors: {stderr}")
+            raise Exception("Windows copy operation failed.")
 
     def _copy_files_robocopy(self, source_drive, target_drive, stage_name, base_progress):
         """Copy files using robocopy with progress tracking"""
@@ -1965,28 +1983,9 @@ rescan
         logger.info("Creating complete GPT header + partition entries for Switch emuMMC...")
 
         # Calculate max LBA for USER partition based on actual emuMMC partition size
-        # The emuMMC internal structure (LBAs are relative to BOOT0 start, which is at protective_offset from partition start):
-        # - LBA 0x0000 - 0x1FFF:   BOOT0 (4MB)
-        # - LBA 0x2000 - 0x3FFF:   BOOT1 (4MB)
-        # - LBA 0x4000 - 0xBFFF:   Protective gap (16MB)
-        # - LBA 0xC000:            USER partition MBR
-        # - LBA 0xC001:            USER partition GPT header
-        # - LBA 0xC002 - 0xC021:   USER partition GPT entries (32 sectors)
-        # - LBA 0xC022 onwards:    First usable sector for partitions
-        #
-        # For USER partition entry in GPT:
-        # - Start: 0x9CC000 (fixed, this is where USER data begins in Switch NAND)
-        # - End: Must not exceed the available space in the emuMMC partition
-        #
-        # Available LBA = (emummc_partition_sectors - protective_offset) - 1 (convert size to last LBA)
-        #               - 34 (reserve for backup GPT header + entries at the end)
-
         if emummc_partition_sectors:
             # Calculate the last usable LBA relative to BOOT0 start
             available_lba = (emummc_partition_sectors - protective_offset) - 1 - 34
-            # USER partition cannot exceed available space
-            # For trimmed emuMMC, this will be less than the standard 0x1D3FFFF (29GB)
-            # Use min() to ensure we don't exceed the actual partition size
             max_user_lba = min(0x1D3FFFF, available_lba)
         else:
             # Default to full 29GB emuMMC size
@@ -2019,45 +2018,34 @@ rescan
 
         # Offset 24-31: Current LBA (location of this header)
         # In emuMMC context, GPT is at sector 0xC001 relative to BOOT0
-        # This is the LBA within the emuMMC "disk", not the SD card absolute sector
         header[24:32] = struct.pack('<Q', 0xC001)
 
         # Compute logical USER region size (exclude protective gap before BOOT0)
-        # emummc_partition_sectors includes protective area; logical usable begins after protective_offset.
         logical_sectors = max(0, emummc_partition_sectors - protective_offset)
-        # Backup GPT LBA = last sector of logical region (relative to BOOT0 start)
-        # We keep values relative to the emuMMC "disk" whose LBA 0 = BOOT0 start + (C000 - protective_offset) nuance
-        # For minimal compatibility we set alt_lba to logical_sectors - 1 if large enough, else a safe minimum.
         alt_lba = logical_sectors - 1 if logical_sectors > 34 else 34
         header[32:40] = struct.pack('<Q', alt_lba)
 
         # Offset 40-47: First usable LBA for partitions = 34
-        # (1 MBR + 1 GPT header + 32 sectors for partition entries)
-        # This is relative to the emuMMC "disk", so it's from the start of the USER partition (0xC000)
         header[40:48] = struct.pack('<Q', 0xC000 + 34)
 
-        # Offset 48-55: Last usable LBA (one before backup header minus 33 for entries/header space)
+        # Offset 48-55: Last usable LBA
         last_use_lba = alt_lba - 33 if alt_lba > 33 else alt_lba
         header[48:56] = struct.pack('<Q', last_use_lba)
 
-        # Offset 56-71: Disk GUID (16 bytes, random)
-        # Use a recognizable pattern for NXMigratorPro: "NXMigratorProGPT"
+        # Offset 56-71: Disk GUID (16 bytes)
         disk_guid = b'NXMigratorProGPT'
         header[56:72] = disk_guid
 
         # Offset 72-79: Starting LBA of partition entries = 2
-        # Partition entries start right after GPT header (0xC001 + 1 = 0xC002)
         header[72:80] = struct.pack('<Q', 0xC002)
 
         # Offset 80-83: Number of partition entries
-        # Standard is 128, but we'll use minimum needed for Switch (around 32)
         header[80:84] = struct.pack('<I', 128)
 
         # Offset 84-87: Size of a single partition entry = 128 bytes
         header[84:88] = struct.pack('<I', 128)
 
         # Offset 88-91: CRC32 of partition entries array
-        # Calculate CRC of the actual partition entries we created
         entries_crc = zlib.crc32(self.generated_gpt_entries) & 0xFFFFFFFF
         header[88:92] = struct.pack('<I', entries_crc)
 
@@ -2127,7 +2115,6 @@ rescan
                 drive_letter += ':'
 
             # Create hekate emuMMC configuration structure
-            # This is required for hekate's "Fix RAW" button to work
             base_path = Path(drive_letter + "\\")
             emummc_path = base_path / "emuMMC"
 
@@ -2140,27 +2127,6 @@ rescan
 
             # Calculate MBR partition offset and emummc.ini sector
             #
-            # The sector in emummc.ini must match the actual offset where the emuMMC data is located.
-            # We detected this offset by finding the GPT header in the source emuMMC.
-            #
-            # Common offsets:
-            #   - 0xC001 (49153 sectors / ~24.09 MB) - Full-size emuMMC with protective offset
-            #   - 0x4001 (16385 sectors / ~8.01 MB) - Resized emuMMC without full protective offset
-            #
-            # The calculation is:
-            #   1. Start with the MBR partition start sector
-            #   2. Add the detected offset from source (0xC001 or 0x4001)
-            #   3. This gives the actual sector where the emuMMC data begins
-            #
-            # NOTE: We do NOT add an additional 0x8000 base offset or round to 0x10000 alignment,
-            # because the data was copied bit-by-bit from source to target, preserving the 
-            # internal structure. The sector in emummc.ini must point to where the data actually is.
-
-            # Get MBR partition start
-            mbr_partition_start = target_emummc_gpt_start
-
-            # Calculate the emummc.ini sector based on how hekate structures emuMMC
-            #
             # Hekate's emuMMC structure (standard layout):
             #   - Partition start (MBR entry)
             #   - +0x0000: Reserved/padding (cleared by hekate)
@@ -2170,30 +2136,21 @@ rescan
             #   - +0xC001: USER partition GPT header
             #
             # Hekate ALWAYS expects emummc.ini sector to point to partition_start + 0x8000,
-            # regardless of how the emuMMC was created. This is because:
-            #   1. Hekate's "Fix RAW" rewrites it to partition + 0x8000
-            #   2. The emuMMC structure has a 16MB protective offset before BOOT0
-            #   3. Even when bit-by-bit copying, the internal offsets are preserved
-            #
-            # When we do bit-by-bit copy from source, we copy the ENTIRE partition including
-            # the 16MB protective offset, so BOOT0 ends up at target_partition + 0x8000.
+            # regardless of how the emuMMC was created.
             
-            # Hekate's standard offset for BOOT0 within the emuMMC partition
             HEKATE_BOOT0_OFFSET = 0x8000
             
             # Calculate the correct sector for emummc.ini
-            boot0_start_sector = mbr_partition_start + HEKATE_BOOT0_OFFSET
+            boot0_start_sector = target_emummc_gpt_start + HEKATE_BOOT0_OFFSET
             emummc_ini_sector = boot0_start_sector
 
             logger.info(f"emuMMC sector calculation:")
-            logger.info(f"  MBR partition start: 0x{mbr_partition_start:X} ({mbr_partition_start:,})")
+            logger.info(f"  MBR partition start: 0x{target_emummc_gpt_start:X} ({target_emummc_gpt_start:,})")
             logger.info(f"  Hekate standard BOOT0 offset: 0x{HEKATE_BOOT0_OFFSET:X} ({HEKATE_BOOT0_OFFSET:,} sectors)")
             logger.info(f"  BOOT0 location: 0x{boot0_start_sector:X} ({boot0_start_sector:,})")
             logger.info(f"  Final sector for emummc.ini: 0x{emummc_ini_sector:X} ({emummc_ini_sector:,})")
 
             # Determine which RAW folder to use (RAW1, RAW2, or RAW3)
-            # Based on which MBR partition the emuMMC is in
-            # For now, we'll use RAW1 as default
             raw_folder_name = "RAW1"
             raw_folder_path = emummc_path / raw_folder_name
 
@@ -2202,16 +2159,12 @@ rescan
             logger.info(f"Created RAW folder at {raw_folder_path}")
 
             # Create raw_based file with the sector offset
-            # This file contains a 4-byte little-endian integer of the sector value for emummc.ini
             raw_based_file = raw_folder_path / "raw_based"
             with open(raw_based_file, 'wb') as f:
-                # Write sector as 4-byte little-endian integer
                 f.write(emummc_ini_sector.to_bytes(4, byteorder='little'))
             logger.info(f"Created raw_based file at {raw_based_file} with sector: 0x{emummc_ini_sector:x}")
 
             # Create emummc.ini file for hekate
-            # The id field should be the RAW folder name encoded as hex (e.g., "RAW1" = 0x31574152)
-            # Calculate id from folder name: "RAW1" = 0x31 0x57 0x41 0x31 (little-endian ASCII)
             folder_id = int.from_bytes(raw_folder_name.encode('ascii')[:4].ljust(4, b'\x00'), byteorder='little')
 
             emummc_ini_path = emummc_path / "emummc.ini"

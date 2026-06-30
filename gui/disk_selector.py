@@ -206,6 +206,27 @@ class DiskSelectorFrame(ttk.Frame):
             return
 
         disk = self.disk_map[selection]
+
+        # Prevent selecting the same physical disk as both source and target.
+        if self.target_disk and disk['path'] == self.target_disk['path']:
+            if self.main_window:
+                self.main_window.show_custom_info(
+                    "Invalid Selection",
+                    "Source disk cannot be the same as target disk!",
+                    width=500,
+                    height=200
+                )
+            self.source_combobox.set('')
+            self.source_disk = None
+            self.source_info.config(text="Not selected\n\n")
+            if self.main_window:
+                self.main_window.source_disk = None
+                self.main_window.source_layout = None
+                self.main_window.source_partition_frame.clear()
+                self.main_window.target_partition_frame.clear()
+                self.main_window.migrate_button.config(state=DISABLED)
+            return
+
         self.source_disk = disk
 
         # Update info label
@@ -235,7 +256,12 @@ class DiskSelectorFrame(ttk.Frame):
                     width=500,
                     height=200
                 )
-            self.target_combobox.set('')
+            self.clear_target()
+            if self.main_window:
+                self.main_window.target_disk = None
+                self.main_window.target_layout = None
+                self.main_window.target_partition_frame.clear()
+                self.main_window.migrate_button.config(state=DISABLED)
             return
 
         self.target_disk = disk

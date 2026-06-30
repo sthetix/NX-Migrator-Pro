@@ -9,7 +9,7 @@ License: GPL-2.0 (same as hekate)
 """
 
 # Version information
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
@@ -57,7 +57,7 @@ def enable_file_logging():
 
 def main():
     """Entry point for the application"""
-    logger.info("Starting NX Migrator Pro v{__version__}")
+    logger.info(f"Starting NX Migrator Pro v{__version__}")
 
     # Set Windows AppUserModelID for proper taskbar icon
     if sys.platform == 'win32':

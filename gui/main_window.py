@@ -686,7 +686,7 @@ class MainWindow:
                 if self.cleanup_options['remove_linux']:
                     msg += f"✗ Linux: {linux_size:,} MB (will be REMOVED)\n"
                 else:
-                    msg += f"✓ Linux: {linux_size:,} MB (preserved)\n"
+                    msg += f"! Linux: {linux_size:,} MB (not selected for removal - cleanup will be blocked)\n"
 
             # Android
             if self.source_layout.has_android:
@@ -695,7 +695,7 @@ class MainWindow:
                 if self.cleanup_options['remove_android']:
                     msg += f"✗ Android ({android_type}): {android_size:,} MB (will be REMOVED)\n"
                 else:
-                    msg += f"✓ Android ({android_type}): {android_size:,} MB (preserved)\n"
+                    msg += f"! Android ({android_type}): {android_size:,} MB (not selected for removal - cleanup will be blocked)\n"
 
             # emuMMC
             if self.source_layout.has_emummc:
@@ -704,7 +704,7 @@ class MainWindow:
                 if self.cleanup_options['remove_emummc']:
                     msg += f"✗ emuMMC ({emummc_type}): {emummc_size:,} MB (will be REMOVED)\n"
                 else:
-                    msg += f"✓ emuMMC ({emummc_type}): {emummc_size:,} MB (preserved)\n"
+                    msg += f"! emuMMC ({emummc_type}): {emummc_size:,} MB (not selected for removal - cleanup will be blocked)\n"
 
             msg += f"\nSD Card: {self.source_disk['size_gb']:.1f} GB"
 
@@ -804,6 +804,15 @@ class MainWindow:
         """Start the migration or cleanup process (depending on mode)"""
 
         if self.current_mode == "migration":
+            if self.source_disk and self.target_disk and self.source_disk['path'] == self.target_disk['path']:
+                self.show_custom_info(
+                    "Invalid Disk Selection",
+                    "Source and target must be different physical disks.",
+                    width=500,
+                    height=220
+                )
+                return
+
             # Show migration info popup first
             file_count, total_bytes = self._get_source_file_info()
             info_response = self._show_migration_info_popup(file_count, total_bytes)
@@ -879,12 +888,31 @@ class MainWindow:
         else:  # cleanup mode
             # Cleanup mode confirmations
             removed_parts = []
+            preserved_raw_parts = []
             if self.cleanup_options['remove_linux'] and self.source_layout.has_linux:
                 removed_parts.append("Linux partition")
+            elif self.source_layout.has_linux:
+                preserved_raw_parts.append("Linux partition")
             if self.cleanup_options['remove_android'] and self.source_layout.has_android:
                 removed_parts.append("Android partitions")
+            elif self.source_layout.has_android:
+                preserved_raw_parts.append("Android partitions")
             if self.cleanup_options['remove_emummc'] and self.source_layout.has_emummc:
                 removed_parts.append("emuMMC partition(s)")
+            elif self.source_layout.has_emummc:
+                preserved_raw_parts.append("emuMMC partition(s)")
+
+            if preserved_raw_parts:
+                self.show_custom_info(
+                    "Unsafe Cleanup Selection",
+                    "Cleanup mode currently restores FAT32 files only.\n\n"
+                    "It cannot safely preserve raw partitions after rebuilding the disk:\n"
+                    f"{', '.join(preserved_raw_parts)}\n\n"
+                    "Select those partitions for removal, or use migration mode to preserve them.",
+                    width=650,
+                    height=360
+                )
+                return
 
             if removed_parts:
                 parts_str = ", ".join(removed_parts)
