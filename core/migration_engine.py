@@ -1121,12 +1121,12 @@ rescan
             logger.warning(f"Could not refresh disk partitions: {e}")
 
     def _copy_files_simple(self, source_drive, target_drive, stage_name, base_progress, progress_range=60):
-        """Copy files using Windows native PowerShell Copy-Item with source-based progress tracking.
+        """Copy files using Windows native Robocopy with process I/O progress tracking.
 
-        This method fixes the progress-stall issue by:
-        1. Building the full file list from SOURCE upfront (read-only, no lock contention)
-        2. Tracking progress by measuring TARGET file sizes (non-recursive, no volume lock)
-        3. Using a sampling strategy to avoid reading thousands of files per check
+        This method:
+        1. Builds the full file list from SOURCE upfront (read-only, no lock contention)
+        2. Tracks actual Robocopy read/write I/O without relying on preallocated file sizes
+        3. Stops with a clear error if the copy performs no disk I/O for two minutes
 
         Args:
             progress_range: Total progress range allocated for file copy (default 60)
@@ -1136,11 +1136,16 @@ rescan
         target = target_drive.rstrip('\\')
 
         logger.info(f"Starting Windows native file copy: {source} -> {target}")
-        logger.info(f"Using PowerShell Copy-Item with source-based progress tracking")
+        logger.info("Using Robocopy with process I/O progress tracking and stall detection")
 
         # Verify source path exists
         if not Path(source).exists():
             raise Exception(f"Source path does not exist: {source}")
+
+        skipped_dirs = ['$Recycle.Bin', 'System Volume Information', '.Trashes',
+                        '$RECYCLE.BIN', 'RECYCLER', '.Trash-1000', '.Trash-1001',
+                        '.Trash-1002', 'found.000', 'FOUND.000']
+        logger.info(f"Will skip problematic directories: {', '.join(skipped_dirs)}")
 
         # =============================================================
         # STEP 1: Build the full file manifest from SOURCE upfront
@@ -1158,6 +1163,7 @@ rescan
 
         try:
             for dirpath, dirnames, filenames in os.walk(source):
+                dirnames[:] = [d for d in dirnames if d not in skipped_dirs]
                 for filename in filenames:
                     filepath = os.path.join(dirpath, filename)
                     try:
@@ -1171,19 +1177,6 @@ rescan
             total_gb = total_bytes / (1024**3)
             logger.info(f"File manifest built: {len(file_list)} files, {total_gb:.2f} GB total")
 
-            if file_list:
-                # Always track the largest files explicitly so progress does not
-                # appear frozen when Copy-Item is busy on a single huge file.
-                largest_sample_count = min(12, len(file_list))
-                largest_sample_indices = [
-                    idx for idx, _ in sorted(
-                        enumerate(file_list),
-                        key=lambda item: item[1][1],
-                        reverse=True
-                    )[:largest_sample_count]
-                ]
-                sample_points = min(64, len(file_list))
-
         except Exception as e:
             logger.warning(f"Could not build file manifest: {e}. Using time-based progress.")
             file_list = []
@@ -1191,37 +1184,54 @@ rescan
             total_gb = 0
 
         # =============================================================
-        # STEP 2: Launch Copy-Item in background
+        # STEP 2: Launch Robocopy in background with no timeout
         # =============================================================
-        ps_script = f'''
-        $ErrorActionPreference = "Continue"
-        $source = "{source}\\*"
-        $destination = "{target}"
+        robocopy_cmd = [
+            'robocopy',
+            source,
+            target,
+            '/E',
+            '/COPY:DAT',
+            '/DCOPY:DAT',
+            '/R:1',
+            '/W:1',
+            '/XJ',
+            '/FFT',
+            '/NP',
+            '/NDL',
+            '/XD',
+            *skipped_dirs
+        ]
 
-        Copy-Item -Path $source -Destination $destination -Recurse -Force -ErrorAction Continue
-
-        if ($?) {{
-            Write-Output "SUCCESS"
-        }} else {{
-            Write-Output "COMPLETED_WITH_ERRORS"
-        }}
-        '''
-
-        logger.info("Executing Windows copy operation...")
+        logger.info("Executing Robocopy file copy operation...")
+        logger.info(f"Robocopy command: {' '.join(robocopy_cmd)}")
         self._report_progress(stage_name, base_progress + 5, "Copying files...")
 
         process = subprocess.Popen(
-            ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps_script],
+            robocopy_cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             creationflags=CREATE_NO_WINDOW
         )
 
+        robocopy_output = []
+
+        def drain_robocopy_output():
+            for line in process.stdout:
+                line = line.rstrip()
+                if line:
+                    robocopy_output.append(line)
+                    if len(robocopy_output) > 200:
+                        del robocopy_output[:100]
+
+        output_thread = threading.Thread(target=drain_robocopy_output, daemon=True)
+        output_thread.start()
+
         # =============================================================
-        # STEP 3: Progress monitoring using SOURCE-BASED tracking
-        # We check which source files have appeared on the target,
-        # measuring only a SAMPLE of target files to avoid lock contention
+        # STEP 3: Progress monitoring using Robocopy process I/O
         # =============================================================
         start_time = time.time()
         last_progress_update = 0.0
@@ -1229,6 +1239,100 @@ rescan
         last_check_time = start_time
         check_interval = 2.0  # Check every 2 seconds
         heartbeat_sent = False
+
+        # Robocopy preallocates destination files, so destination file sizes do
+        # not represent completed writes. Track the child process's actual I/O.
+        stall_timeout = 120.0
+        last_activity_time = start_time
+        last_activity_bytes = 0
+        last_transferred_bytes = 0
+        last_speed_time = start_time
+
+        try:
+            process_info = psutil.Process(process.pid)
+            initial_io = process_info.io_counters()
+            initial_read_bytes = initial_io.read_bytes
+            initial_write_bytes = initial_io.write_bytes
+        except (psutil.Error, AttributeError) as e:
+            process_info = None
+            initial_read_bytes = 0
+            initial_write_bytes = 0
+            logger.warning(f"Could not initialize Robocopy I/O monitoring: {e}")
+
+        while process.poll() is None:
+            if self.cancelled:
+                process.kill()
+                process.wait()
+                output_thread.join(timeout=5)
+                raise Exception("Migration cancelled by user")
+
+            current_time = time.time()
+            if current_time - last_check_time < check_interval:
+                time.sleep(0.5)
+                continue
+
+            elapsed = current_time - start_time
+            if process_info is None:
+                logger.info(f"Copying... {elapsed / 60:.1f} minutes elapsed")
+                self._report_progress(stage_name, base_progress + 5, "Copying files...")
+                last_check_time = current_time
+                continue
+
+            try:
+                io = process_info.io_counters()
+                read_bytes = max(0, io.read_bytes - initial_read_bytes)
+                write_bytes = max(0, io.write_bytes - initial_write_bytes)
+            except (psutil.Error, AttributeError) as e:
+                logger.warning(f"Robocopy I/O monitoring unavailable: {e}")
+                process_info = None
+                last_check_time = current_time
+                continue
+
+            activity_bytes = max(read_bytes, write_bytes)
+            transferred_bytes = min(read_bytes, write_bytes)
+
+            if activity_bytes > last_activity_bytes:
+                last_activity_bytes = activity_bytes
+                last_activity_time = current_time
+            elif current_time - last_activity_time >= stall_timeout:
+                process.kill()
+                process.wait()
+                output_thread.join(timeout=5)
+                stalled_seconds = int(current_time - last_activity_time)
+                logger.error(f"Robocopy stalled: no disk I/O for {stalled_seconds} seconds")
+                if robocopy_output:
+                    logger.error(f"Last Robocopy output: {robocopy_output[-1]}")
+                raise Exception(
+                    f"File copy stalled with no disk activity for {stalled_seconds} seconds. "
+                    "Check the SD card and reader."
+                )
+
+            speed_elapsed = current_time - last_speed_time
+            speed_bytes = max(0, transferred_bytes - last_transferred_bytes)
+            speed_mbps = speed_bytes / (1024 * 1024) / speed_elapsed if speed_elapsed > 0 else 0
+            last_transferred_bytes = transferred_bytes
+            last_speed_time = current_time
+
+            displayed_bytes = min(total_bytes, transferred_bytes) if total_bytes > 0 else transferred_bytes
+            copied_gb = displayed_bytes / (1024**3)
+
+            if total_bytes > 0:
+                percent = min(95, displayed_bytes / total_bytes * 100)
+                progress = base_progress + (percent / 100 * progress_range * 0.9)
+                logger.info(
+                    f"Copying: {copied_gb:.2f} GB / {total_gb:.2f} GB "
+                    f"({percent:.1f}%) at {speed_mbps:.1f} MB/s"
+                )
+                self._report_progress(
+                    stage_name,
+                    progress,
+                    f"Copied {copied_gb:.1f}/{total_gb:.1f} GB ({percent:.0f}%)"
+                )
+            else:
+                logger.info(f"Copying: {copied_gb:.2f} GB at {speed_mbps:.1f} MB/s")
+                self._report_progress(stage_name, base_progress + 5, f"Copied {copied_gb:.1f} GB")
+
+            last_check_time = current_time
 
         while process.poll() is None:
             if self.cancelled:
@@ -1247,40 +1351,58 @@ rescan
                         # of files per check — this is fast and has no lock contention
                         # =============================================================
                         sample_step = max(1, len(file_list) // max(1, sample_points))
-                        copied_bytes = 0
-                        files_checked = 0
-                        sampled_indices = set(largest_sample_indices)
+                        largest_indices = set(largest_sample_indices)
+                        sampled_indices = set()
 
                         # Rotate the stride start each pass so different parts of
                         # the tree get measured over time instead of re-checking
                         # the exact same files forever.
                         for i in range(sample_offset, len(file_list), sample_step):
-                            sampled_indices.add(i)
+                            if i not in largest_indices:
+                                sampled_indices.add(i)
 
                         sample_offset = (sample_offset + 1) % sample_step
 
-                        for i in sorted(sampled_indices):
+                        copied_largest_bytes = 0
+                        total_largest_bytes = 0
+                        copied_sampled_bytes = 0
+                        total_sampled_bytes = 0
+
+                        for i in sorted(largest_indices | sampled_indices):
                             rel_path, size = file_list[i]
                             target_path = os.path.join(target, rel_path)
+                            copied_size = 0
                             try:
                                 if os.path.exists(target_path):
                                     # Only count if it's actually the same size or larger
                                     # (partially-written files won't show inflated progress)
                                     actual_size = os.path.getsize(target_path)
                                     if actual_size >= size:
-                                        copied_bytes += size
+                                        copied_size = size
                                     elif actual_size > 0:
                                         # File exists but not yet complete — count partial
-                                        copied_bytes += actual_size
-                                files_checked += 1
+                                        copied_size = actual_size
                             except (OSError, PermissionError):
                                 pass
 
-                        if total_bytes > 0 and files_checked > 0:
-                            # Estimate total based on checked sample
-                            sampled_ratio = files_checked / len(file_list)
-                            estimated_total = copied_bytes / sampled_ratio if sampled_ratio > 0 else 0
-                            estimated_total = max(last_estimated_total, estimated_total)
+                            if i in largest_indices:
+                                total_largest_bytes += size
+                                copied_largest_bytes += copied_size
+                            else:
+                                total_sampled_bytes += size
+                                copied_sampled_bytes += copied_size
+
+                        if total_bytes > 0:
+                            # Track the deliberately selected largest files exactly.
+                            # Extrapolate only the rotating unbiased sample so those
+                            # large files cannot inflate the estimate beyond reality.
+                            remaining_bytes = max(0, total_bytes - total_largest_bytes)
+                            sampled_completion = (
+                                copied_sampled_bytes / total_sampled_bytes
+                                if total_sampled_bytes > 0 else 0
+                            )
+                            estimated_total = copied_largest_bytes + (remaining_bytes * sampled_completion)
+                            estimated_total = min(total_bytes, max(last_estimated_total, estimated_total))
                             last_estimated_total = estimated_total
                             percent = min(95, (estimated_total / total_bytes * 100))
                         else:
@@ -1321,16 +1443,13 @@ rescan
         # =============================================================
         # STEP 4: Copy completed — get final state
         # =============================================================
-        stdout, stderr = process.communicate()
+        process.wait()
+        output_thread.join(timeout=5)
+        stdout = "\n".join(robocopy_output)
+        stderr = ""
         elapsed_time = time.time() - start_time
 
-        if "COMPLETED_WITH_ERRORS" in stdout:
-            logger.error("Copy completed with errors; treating as failed to avoid incomplete FAT32 data.")
-            if stderr:
-                logger.error(f"PowerShell errors: {stderr}")
-            raise Exception("Windows copy operation completed with errors. Check logs for skipped files.")
-
-        if "SUCCESS" in stdout:
+        if process.returncode < 8:
             final_gb = 0.0
 
             # Get final size from target
@@ -1350,6 +1469,7 @@ rescan
 
                 logger.info(f"Windows copy completed in {elapsed_time:.1f} seconds")
                 logger.info(f"Data copied: {final_gb:.2f} GB ({final_bytes:,} bytes) at {speed_mbps:.1f} MB/s")
+                logger.info(f"Robocopy return code: {process.returncode}")
 
             except Exception as e:
                 logger.warning(f"Could not get final copy size: {e}")
@@ -1407,7 +1527,7 @@ rescan
 
                 fix_result = subprocess.run(
                     ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', fix_script],
-                    capture_output=True, text=True, timeout=300,
+                    capture_output=True, text=True,
                     creationflags=CREATE_NO_WINDOW
                 )
 
@@ -1430,10 +1550,12 @@ rescan
             logger.info("FAT32 file copy completed successfully")
 
         else:
-            logger.error(f"PowerShell copy failed: {process.returncode}")
+            logger.error(f"Robocopy failed with return code: {process.returncode}")
+            if stdout:
+                logger.error(f"Robocopy output: {stdout[-2000:]}")
             if stderr:
-                logger.error(f"PowerShell errors: {stderr}")
-            raise Exception("Windows copy operation failed.")
+                logger.error(f"Robocopy errors: {stderr}")
+            raise Exception(f"Windows copy operation failed with robocopy exit code {process.returncode}.")
 
     def _copy_files_robocopy(self, source_drive, target_drive, stage_name, base_progress):
         """Copy files using robocopy with progress tracking"""
