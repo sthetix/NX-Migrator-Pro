@@ -375,11 +375,6 @@ class PartitionScanner:
             target_layout.android_dynamic = source_layout.android_dynamic
             logger.info(f"Will migrate Android: {source_layout.android_size_mb} MB")
 
-        # Set has_gpt based on whether we're migrating Android
-        # GPT is only needed when Android partitions exist (too many to fit in MBR)
-        target_layout.has_gpt = (source_layout.has_android and options['migrate_android'])
-        logger.info(f"Target will use {'hybrid MBR+GPT' if target_layout.has_gpt else 'pure MBR'} partition table")
-
         # emuMMC (fixed size if migrating)
         if source_layout.has_emummc and options['migrate_emummc']:
             total_reserved_mb += source_layout.emummc_size_mb
@@ -388,7 +383,11 @@ class PartitionScanner:
         else:
             logger.warning(f"NOT migrating emuMMC - has_emummc={source_layout.has_emummc}, migrate_emummc={options.get('migrate_emummc', 'NOT SET')}")
 
-        # FAT32 - expand if requested
+        # FAT32 - expand if requested, or shrink to fit for same-size clone
+        has_gpt = (source_layout.has_android and options['migrate_android'])
+        logger.info(f"Target will use {'hybrid MBR+GPT' if has_gpt else 'pure MBR'} partition table")
+
+        fat32_sectors = None
         if options['expand_fat32']:
             # Calculate available space
             total_disk_mb = (target_layout.total_sectors * SECTOR_SIZE) // (1024 * 1024)
@@ -400,7 +399,7 @@ class PartitionScanner:
             # - GPT backup structures (33 sectors for entries + 1 sector for header)
             # - Windows sector access quirks near disk boundaries
             # - Safety margin to prevent "sector not found" errors
-            if target_layout.has_gpt:
+            if has_gpt:
                 # GPT: Reserve for backup structures + alignment + safety
                 end_reserve_mb = 20
             else:
@@ -409,12 +408,25 @@ class PartitionScanner:
 
             reserved_mb = total_reserved_mb + start_alignment_mb + end_reserve_mb
             fat32_size_mb = total_disk_mb - reserved_mb
+        elif options.get('shrink_fat32_to_fit'):
+            fat32_sectors = self._shrink_fat32_for_clone(
+                source_layout,
+                target_layout.total_sectors,
+                has_gpt,
+                options
+            )
+            fat32_size_mb = (fat32_sectors * SECTOR_SIZE) // (1024 * 1024)
         else:
             fat32_size_mb = source_layout.fat32_size_mb
 
+        # Set has_gpt based on whether we're migrating Android
+        # GPT is only needed when Android partitions exist (too many to fit in MBR)
+        target_layout.has_gpt = has_gpt
+
         # Create partition objects (in order)
         # 1. FAT32
-        fat32_sectors = (fat32_size_mb * 1024 * 1024) // SECTOR_SIZE
+        if fat32_sectors is None:
+            fat32_sectors = (fat32_size_mb * 1024 * 1024) // SECTOR_SIZE
         fat32_part = Partition(
             name='hos_data',
             type_id=0x0C,
@@ -523,3 +535,64 @@ class PartitionScanner:
                 )
 
         return target_layout
+
+    def _compute_layout_end_sector(self, source_layout: DiskLayout, has_gpt: bool,
+                                   options: Dict, fat32_sectors: int) -> int:
+        """Calculate the end sector of the last partition for a given FAT32 size."""
+        current_lba = ALIGN_SECTORS + fat32_sectors
+
+        if current_lba % ALIGN_SECTORS != 0:
+            current_lba = ((current_lba + ALIGN_SECTORS - 1) // ALIGN_SECTORS) * ALIGN_SECTORS
+
+        if source_layout.has_linux and options['migrate_linux']:
+            linux_sectors = (source_layout.linux_size_mb * 1024 * 1024) // SECTOR_SIZE
+            current_lba += linux_sectors
+            if current_lba % ALIGN_SECTORS != 0:
+                current_lba = ((current_lba + ALIGN_SECTORS - 1) // ALIGN_SECTORS) * ALIGN_SECTORS
+
+        if source_layout.has_android and options['migrate_android']:
+            for apart in source_layout.get_android_partitions():
+                current_lba += apart.size_sectors
+            if current_lba % ALIGN_SECTORS != 0:
+                current_lba = ((current_lba + ALIGN_SECTORS - 1) // ALIGN_SECTORS) * ALIGN_SECTORS
+
+        if source_layout.has_emummc and options['migrate_emummc']:
+            safety_margin = 2048  # 1MB
+            for epart in source_layout.get_emummc_partitions():
+                current_lba += max(0, epart.size_sectors - safety_margin)
+
+        return current_lba
+
+    def _shrink_fat32_for_clone(self, source_layout: DiskLayout, target_total_sectors: int,
+                                has_gpt: bool, options: Dict) -> int:
+        """
+        Shrink FAT32 to fit fixed trailing partitions on a slightly smaller same-size SD card.
+        Returns FAT32 size in sectors.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        source_fat32_sectors = (source_layout.fat32_size_mb * 1024 * 1024) // SECTOR_SIZE
+        fat32_sectors = source_fat32_sectors
+        min_fat32_sectors = ALIGN_SECTORS  # 16 MB minimum
+
+        while fat32_sectors >= min_fat32_sectors:
+            end_sector = self._compute_layout_end_sector(
+                source_layout, has_gpt, options, fat32_sectors
+            )
+            if end_sector <= target_total_sectors:
+                if fat32_sectors < source_fat32_sectors:
+                    reduced_mb = ((source_fat32_sectors - fat32_sectors) * SECTOR_SIZE) / (1024 * 1024)
+                    logger.warning(
+                        f"Shrunk FAT32 by {reduced_mb:.1f} MB to fit same-size target SD card"
+                    )
+                return fat32_sectors
+
+            overflow_sectors = end_sector - target_total_sectors
+            fat32_sectors -= max(overflow_sectors, 2048)
+
+        raise ValueError(
+            "Fixed partitions (Linux, Android, emuMMC) exceed target disk capacity.\n\n"
+            "The target SD card is too small to hold all non-FAT32 partitions.\n"
+            "Please use a larger capacity SD card."
+        )
