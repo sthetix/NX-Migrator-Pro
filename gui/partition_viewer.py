@@ -5,7 +5,10 @@ Partition Viewer Widget - Display partition layout visually
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from tkinter import Canvas
-from ttkbootstrap.scrolled import ScrolledFrame
+try:
+    from ttkbootstrap.widgets.scrolled import ScrolledFrame
+except ImportError:
+    from ttkbootstrap.scrolled import ScrolledFrame
 
 class PartitionViewerFrame(ttk.Frame):
     """Widget to display partition layout"""
