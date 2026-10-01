@@ -73,6 +73,7 @@ class MainWindow:
 
         # Settings
         self.temp_backup_dir = None  # None = use system default (temp folder)
+        self.allow_same_size_clone = False  # Experimental: allow same-capacity-tier cloning
         self._load_settings()
 
         # Build UI
@@ -95,6 +96,8 @@ class MainWindow:
         settings_menu = ttk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Settings", menu=settings_menu)
         settings_menu.add_command(label="Temp Backup Directory", command=self._show_backup_dir_settings)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Experimental...", command=self._show_experimental_settings)
 
         # Help Menu
         help_menu = ttk.Menu(menubar, tearoff=0)
@@ -396,14 +399,27 @@ class MainWindow:
             source_tier = get_sd_tier(self.source_disk['size_gb'])
             target_tier = get_sd_tier(disk_info['size_gb'])
 
-            # Target must be same tier or larger
+            # Target must be larger, or same tier when experimental clone mode is enabled
             if target_tier < source_tier:
                 self.show_custom_info(
                     "Invalid Target",
                     f"Target disk ({disk_info['letter']}, {disk_info['size_gb']:.1f} GB) is smaller than source disk ({self.source_disk['letter']}, {self.source_disk['size_gb']:.1f} GB).\n\n"
-                    f"Target must be same capacity tier ({source_tier} GB) or larger.",
+                    f"Target must be a larger capacity SD card.",
                     width=500,
                     height=220
+                )
+                self.disk_selector.clear_target()
+                self.target_disk = None
+                return
+
+            if target_tier == source_tier and not self.allow_same_size_clone:
+                self.show_custom_info(
+                    "Same-Size SD Not Allowed",
+                    f"Target disk ({disk_info['letter']}, {disk_info['size_gb']:.1f} GB) is the same capacity tier as the source ({source_tier} GB).\n\n"
+                    f"By default, migration requires a larger SD card.\n\n"
+                    f"To clone to a same-size SD card, enable the experimental setting under Settings > Experimental.",
+                    width=520,
+                    height=260
                 )
                 self.disk_selector.clear_target()
                 self.target_disk = None
@@ -566,12 +582,15 @@ class MainWindow:
                 # Check if Clone Mode (same capacity tier)
                 source_tier = get_sd_tier(self.source_disk['size_gb'])
                 target_tier = get_sd_tier(self.target_disk['size_gb'])
-                is_clone_mode = (source_tier == target_tier)
+                is_clone_mode = (
+                    self.allow_same_size_clone and source_tier == target_tier
+                )
 
-                # In Clone Mode, override expand_fat32 to False
+                # In Clone Mode, override expand_fat32 to False and shrink FAT32 if needed
                 options_for_calc = self.migration_options.copy()
                 if is_clone_mode:
                     options_for_calc['expand_fat32'] = False
+                    options_for_calc['shrink_fat32_to_fit'] = True
 
                 # Migration mode: calculate layout for target disk
                 new_layout = self.scanner.calculate_target_layout(
@@ -1510,6 +1529,7 @@ Made for the Nintendo Switch homebrew community
                 with open('.nx_migrator_prefs.json', 'r') as f:
                     prefs = json.load(f)
                     self.temp_backup_dir = prefs.get('temp_backup_dir', None)
+                    self.allow_same_size_clone = prefs.get('allow_same_size_clone', False)
         except Exception:
             pass
 
@@ -1524,6 +1544,7 @@ Made for the Nintendo Switch homebrew community
 
             # Update with current settings
             prefs['temp_backup_dir'] = self.temp_backup_dir
+            prefs['allow_same_size_clone'] = self.allow_same_size_clone
 
             with open('.nx_migrator_prefs.json', 'w') as f:
                 json.dump(prefs, f)
@@ -1619,6 +1640,95 @@ Made for the Nintendo Switch homebrew community
         ).pack(side=LEFT, padx=5)
 
         # Center dialog
+        dialog.update_idletasks()
+        parent_x = self.root.winfo_x()
+        parent_y = self.root.winfo_y()
+        parent_w = self.root.winfo_width()
+        parent_h = self.root.winfo_height()
+        x = parent_x + (parent_w // 2) - (width // 2)
+        y = parent_y + (parent_h // 2) - (height // 2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        dialog.deiconify()
+        dialog.lift()
+        dialog.attributes('-topmost', True)
+        dialog.after(100, lambda: dialog.attributes('-topmost', False))
+        dialog.focus_force()
+
+    def _show_experimental_settings(self):
+        """Show dialog for experimental settings"""
+        dialog = ttk.Toplevel(self.root)
+        dialog.title("Experimental Settings")
+        dialog.transient(self.root)
+        dialog.withdraw()
+        dialog.grab_set()
+
+        width = 620
+        height = 320
+
+        main_frame = ttk.Frame(dialog, padding=20)
+        main_frame.pack(fill=BOTH, expand=True)
+
+        ttk.Label(
+            main_frame,
+            text="Experimental Settings",
+            font=("Segoe UI", 12, "bold")
+        ).pack(pady=(0, 10))
+
+        ttk.Label(
+            main_frame,
+            text="These features are experimental and may fail in edge cases.\nUse at your own risk.",
+            justify=CENTER,
+            bootstyle=WARNING
+        ).pack(pady=(0, 15))
+
+        clone_var = ttk.BooleanVar(value=self.allow_same_size_clone)
+        clone_check = ttk.Checkbutton(
+            main_frame,
+            text="Allow cloning to same-size SD card",
+            variable=clone_var,
+            bootstyle="warning-round-toggle"
+        )
+        clone_check.pack(anchor=W, pady=(0, 10))
+
+        ttk.Label(
+            main_frame,
+            text=(
+                "Enables Clone Mode when the target SD card is the same capacity tier\n"
+                "as the source (e.g. 128 GB to 128 GB). Partitions are copied without\n"
+                "FAT32 expansion. If the target card is slightly smaller, the FAT32\n"
+                "partition is automatically shrunk to fit."
+            ),
+            justify=LEFT,
+            font=("Segoe UI", 9),
+            wraplength=560
+        ).pack(anchor=W, pady=(0, 15))
+
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(pady=(10, 0))
+
+        def save_and_close():
+            self.allow_same_size_clone = clone_var.get()
+            self._save_settings()
+            status = "enabled" if self.allow_same_size_clone else "disabled"
+            self._update_status(f"Experimental same-size SD clone: {status}")
+            dialog.destroy()
+
+        ttk.Button(
+            button_frame,
+            text="Save",
+            command=save_and_close,
+            bootstyle="primary",
+            width=12
+        ).pack(side=LEFT, padx=5)
+
+        ttk.Button(
+            button_frame,
+            text="Cancel",
+            command=dialog.destroy,
+            bootstyle="secondary",
+            width=12
+        ).pack(side=LEFT, padx=5)
+
         dialog.update_idletasks()
         parent_x = self.root.winfo_x()
         parent_y = self.root.winfo_y()
