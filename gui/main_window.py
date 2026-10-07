@@ -1122,12 +1122,19 @@ class MainWindow:
         info_frame = ttk.Frame(dialog, padding=20)
         info_frame.pack(fill=BOTH, expand=True)
 
-        ttk.Label(info_frame, text=message, wraplength=width-60, justify=CENTER).pack(pady=20)
+        message_label = ttk.Label(info_frame, text=message, wraplength=width-60, justify=CENTER)
+        message_label.pack(pady=20)
 
         ttk.Button(info_frame, text="OK", command=dialog.destroy, bootstyle="primary").pack()
 
         # Update geometry and calculate centered position
         dialog.update_idletasks()
+        max_width = self.root.winfo_screenwidth() - 100
+        while dialog.winfo_reqheight() > screen_height - 100 and width < max_width:
+            width = min(width + 80, max_width)
+            message_label.configure(wraplength=width-60)
+            dialog.update_idletasks()
+
         width = max(width, dialog.winfo_reqwidth())
         height = max(height, dialog.winfo_reqheight())
 
@@ -1185,7 +1192,8 @@ class MainWindow:
 
         info_frame = ttk.Frame(dialog, padding=20)
         info_frame.pack(fill=BOTH, expand=True)
-        ttk.Label(info_frame, text=message, wraplength=width-60, justify=CENTER).pack(pady=20)
+        message_label = ttk.Label(info_frame, text=message, wraplength=width-60, justify=CENTER)
+        message_label.pack(pady=20)
 
         button_frame = ttk.Frame(info_frame)
         button_frame.pack(pady=20)
@@ -1194,6 +1202,14 @@ class MainWindow:
 
         # Update geometry and calculate centered position
         dialog.update_idletasks()
+        max_width = self.root.winfo_screenwidth() - 100
+        while dialog.winfo_reqheight() > screen_height - 100 and width < max_width:
+            width = min(width + 80, max_width)
+            message_label.configure(wraplength=width-60)
+            dialog.update_idletasks()
+
+        width = max(width, dialog.winfo_reqwidth())
+        height = max(height, dialog.winfo_reqheight())
 
         # Get parent window position
         parent_x = self.root.winfo_x()
@@ -1457,6 +1473,8 @@ Made for the Nintendo Switch homebrew community
 
         # Update geometry and calculate centered position
         dialog.update_idletasks()
+        width = max(width, dialog.winfo_reqwidth())
+        height = max(height, dialog.winfo_reqheight())
 
         # Get parent window position
         parent_x = self.root.winfo_x()
@@ -1620,6 +1638,8 @@ Made for the Nintendo Switch homebrew community
 
         # Center dialog
         dialog.update_idletasks()
+        width = max(width, dialog.winfo_reqwidth())
+        height = max(height, dialog.winfo_reqheight())
         parent_x = self.root.winfo_x()
         parent_y = self.root.winfo_y()
         parent_w = self.root.winfo_width()
